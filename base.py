@@ -21,9 +21,9 @@ import urllib.error
 #  Достаточно менять __version__ и пушить обновлённый файл в ветку —
 #  публиковать релизы не требуется.
 # --------------------------------------------------------------------------
-__version__ = "1.0.0"                 # текущая версия приложения (увеличивайте при каждом обновлении)
-GITHUB_OWNER = "Easyzet"            # владелец репозитория на GitHub
-GITHUB_REPO = "base__4"       # имя репозитория
+__version__ = "1.0.1"                 # текущая версия приложения (увеличивайте при каждом обновлении)
+GITHUB_OWNER = "Easyzet"             # владелец репозитория на GitHub
+GITHUB_REPO = "base__4"              # имя репозитория
 GITHUB_BRANCH = "main"               # ветка, из которой берётся обновление (обычно main или master)
 # Путь к файлу внутри репозитория. Если файл лежит в корне — оставьте имя файла.
 # Если в подпапке — укажите, например, "src/base.py".
@@ -213,7 +213,36 @@ class ExcelViewerApp:
         main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
         # ==== Панель вкладок с инструментами ====
-        toolbar = ttk.Notebook(main_frame)
+        # Тема clam корректно поддерживает подсветку вкладок при наведении и
+        # эффект нажатия (в родной теме Windows это игнорируется).
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure("Lively.TNotebook",
+                        background="#f0f0f0", borderwidth=0,
+                        tabmargins=[4, 4, 4, 0])
+        style.configure("Lively.TNotebook.Tab",
+                        padding=[14, 6], font=("Arial", 10),
+                        background="#e4e4e4", foreground="#333333", borderwidth=1)
+        # selected — выбранная вкладка; active — вкладка под курсором (наведение);
+        # pressed — момент клика. Увеличенный padding даёт эффект «раздувания».
+        style.map("Lively.TNotebook.Tab",
+                  background=[("selected", "#1565c0"),
+                              ("pressed", "#0d47a1"),
+                              ("active", "#bbdefb")],
+                  foreground=[("selected", "white"),
+                              ("pressed", "white"),
+                              ("active", "#0d47a1")],
+                  padding=[("selected", [18, 9]),
+                           ("pressed", [18, 9]),
+                           ("active", [18, 9])],
+                  font=[("selected", ("Arial", 10, "bold")),
+                        ("active", ("Arial", 10, "bold"))],
+                  expand=[("selected", [1, 1, 1, 0])])
+
+        toolbar = ttk.Notebook(main_frame, style="Lively.TNotebook")
         toolbar.pack(fill=tk.X, pady=(0, 8))
 
         def _make_tab(title):
@@ -583,11 +612,11 @@ class ExcelViewerApp:
         results_inner.bind("<Configure>",
                            lambda e: res_canvas.configure(scrollregion=res_canvas.bbox("all")))
 
-        def _res_wheel(e):
-            res_canvas.yview_scroll(int(-1 * (e.delta / 120)) if e.delta else 0, "units")
-
-        res_canvas.bind("<Enter>", lambda e: res_canvas.bind_all("<MouseWheel>", _res_wheel))
-        res_canvas.bind("<Leave>", lambda e: res_canvas.unbind_all("<MouseWheel>"))
+        # Прокрутка колёсиком в области результатов. Проблема была в том, что
+        # внутренние таблицы (Treeview) сами перехватывают колесо мыши, поэтому
+        # обработчик навешивается рекурсивно на канвас и на все дочерние виджеты
+        # (в т.ч. на добавляемые таблицы — см. _render_block).
+        criteria_window._res_canvas = res_canvas
 
         # --- Нижняя панель под полем таблиц (слева снизу) ---
         bottom_actions = tk.Frame(criteria_window)
@@ -605,6 +634,40 @@ class ExcelViewerApp:
         criteria_window.results_inner = results_inner
         criteria_window.result_blocks = []
         criteria_window.df = df
+        self._bind_results_wheel(criteria_window)
+
+    def _bind_results_wheel(self, window):
+        """Навешивает прокрутку колёсиком на область результатов и ВСЕ её дочерние
+        виджеты (включая таблицы), чтобы колесо работало над любой их частью."""
+        canvas = getattr(window, "_res_canvas", None)
+        if canvas is None:
+            return
+
+        def _wheel(event):
+            if getattr(event, "num", None) == 4:            # Linux вверх
+                canvas.yview_scroll(-1, "units")
+            elif getattr(event, "num", None) == 5:          # Linux вниз
+                canvas.yview_scroll(1, "units")
+            elif event.delta:                               # Windows/macOS
+                if abs(event.delta) >= 120:
+                    step = int(-event.delta / 120)
+                else:
+                    step = -1 if event.delta > 0 else 1
+                canvas.yview_scroll(step, "units")
+            return "break"
+
+        def _apply(widget):
+            try:
+                widget.bind("<MouseWheel>", _wheel)
+                widget.bind("<Button-4>", _wheel)
+                widget.bind("<Button-5>", _wheel)
+            except Exception:
+                pass
+            for child in widget.winfo_children():
+                _apply(child)
+
+        _apply(canvas)
+        _apply(window.results_inner)
 
     def _selected_columns(self, tree):
         """Имена выбранных признаков (в порядке таблицы). Имя — ячейка 'column'."""
@@ -1481,6 +1544,9 @@ class ExcelViewerApp:
         if block["kind"] == "count" and block.get("ci"):
             tk.Label(frame, text=block["ci"]["text"], font=("Arial", 9),
                      fg="#222222", anchor="w", justify=tk.LEFT).pack(side=tk.TOP, fill=tk.X, pady=(3, 0))
+
+        # Перепривязываем колесо мыши на новые виджеты таблицы
+        self._bind_results_wheel(window)
 
     def _count_flat_rows(self, model, specs=None):
         """Преобразует модель частот в плоские строки для Treeview.
