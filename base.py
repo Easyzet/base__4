@@ -10,9 +10,11 @@ from docx.enum.table import WD_ALIGN_VERTICAL
 import numpy as np
 import math
 import re
+from decimal import Decimal, ROUND_HALF_UP
 import os
 import sys
 import json
+import subprocess
 import urllib.request
 import urllib.error
 
@@ -21,7 +23,7 @@ import urllib.error
 #  Достаточно менять __version__ и пушить обновлённый файл в ветку —
 #  публиковать релизы не требуется.
 # --------------------------------------------------------------------------
-__version__ = "1.0.1"                 # текущая версия приложения (увеличивайте при каждом обновлении)
+__version__ = "1.0.2"                 # текущая версия приложения (увеличивайте при каждом обновлении)
 GITHUB_OWNER = "Easyzet"             # владелец репозитория на GitHub
 GITHUB_REPO = "base__4"              # имя репозитория
 GITHUB_BRANCH = "main"               # ветка, из которой берётся обновление (обычно main или master)
@@ -64,6 +66,30 @@ def _version_is_newer(remote, local):
     rv += (0,) * (n - len(rv))
     lv += (0,) * (n - len(lv))
     return rv > lv
+
+
+class _MenuItemProxy:
+    """Позволяет обращаться к пункту меню так же, как к кнопке — через .config(state=...).
+    Благодаря этому существующий код включения/выключения кнопок работает без изменений."""
+    def __init__(self, menu, label):
+        self._menu = menu
+        self._label = label
+
+    def config(self, **kwargs):
+        opts = {}
+        if kwargs.get("state") is not None:
+            opts["state"] = str(kwargs["state"])
+        if kwargs.get("text") is not None:
+            opts["label"] = kwargs["text"]
+        if opts:
+            try:
+                self._menu.entryconfigure(self._label, **opts)
+                if "label" in opts:
+                    self._label = opts["label"]
+            except Exception:
+                pass
+
+    configure = config
 
 
 class ColumnConfigDialog:
@@ -212,91 +238,59 @@ class ExcelViewerApp:
         main_frame = tk.Frame(self.root)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
-        # ==== Панель вкладок с инструментами ====
-        # Тема clam корректно поддерживает подсветку вкладок при наведении и
-        # эффект нажатия (в родной теме Windows это игнорируется).
-        style = ttk.Style()
-        try:
-            style.theme_use("clam")
-        except Exception:
-            pass
-        style.configure("Lively.TNotebook",
-                        background="#f0f0f0", borderwidth=0,
-                        tabmargins=[4, 4, 4, 0])
-        style.configure("Lively.TNotebook.Tab",
-                        padding=[14, 6], font=("Arial", 10),
-                        background="#e4e4e4", foreground="#333333", borderwidth=1)
-        # selected — выбранная вкладка; active — вкладка под курсором (наведение);
-        # pressed — момент клика. Увеличенный padding даёт эффект «раздувания».
-        style.map("Lively.TNotebook.Tab",
-                  background=[("selected", "#1565c0"),
-                              ("pressed", "#0d47a1"),
-                              ("active", "#bbdefb")],
-                  foreground=[("selected", "white"),
-                              ("pressed", "white"),
-                              ("active", "#0d47a1")],
-                  padding=[("selected", [18, 9]),
-                           ("pressed", [18, 9]),
-                           ("active", [18, 9])],
-                  font=[("selected", ("Arial", 10, "bold")),
-                        ("active", ("Arial", 10, "bold"))],
-                  expand=[("selected", [1, 1, 1, 0])])
+        # ==== Верхнее выпадающее меню (в стиле MS Office) ====
+        # Нативное меню: вкладки выпадают вниз вертикально, не висят постоянно,
+        # закрываются по клику вне меню или Esc, пункты подсвечиваются при наведении.
+        menubar = tk.Menu(self.root, tearoff=0)
+        self.root.config(menu=menubar)
 
-        toolbar = ttk.Notebook(main_frame, style="Lively.TNotebook")
-        toolbar.pack(fill=tk.X, pady=(0, 8))
+        # --- Меню «Файл» ---
+        file_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Файл", menu=file_menu)
+        file_menu.add_command(label="Загрузить Excel", command=self.load_excel_file)
+        file_menu.add_command(label="Сохранить Excel", command=self.save_excel_file, state=tk.DISABLED)
+        file_menu.add_command(label="Сохранить как лист", command=self.save_current_table_as_sheet,
+                              state=tk.DISABLED)
+        file_menu.add_separator()
+        file_menu.add_command(label="Очистить (закрыть файл)", command=self.clear_data)
 
-        def _make_tab(title):
-            f = tk.Frame(toolbar)
-            toolbar.add(f, text=title)
-            return f
+        # --- Меню «Таблица» ---
+        table_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Таблица", menu=table_menu)
+        table_menu.add_command(label="Сбросить все фильтры", command=self.reset_all_filters,
+                               state=tk.DISABLED)
+        table_menu.add_separator()
+        table_menu.add_command(label="Добавить столбец", command=self.add_column_dialog)
+        table_menu.add_command(label="Добавить строку", command=self.add_row)
+        table_menu.add_separator()
+        table_menu.add_command(label="Поиск", command=self.search_dialog)
+        table_menu.add_command(label="Замена", command=self.replace_dialog)
+        table_menu.add_separator()
+        table_menu.add_command(label="Настроить таблицу", command=self.configure_table,
+                               state=tk.DISABLED)
 
-        # --- Вкладка «Файл» ---
-        tab_file = _make_tab("Файл")
-        self.load_button = tk.Button(tab_file, text="Загрузить Excel",
-                                     command=self.load_excel_file, bg="blue", fg="white")
-        self.load_button.pack(side=tk.LEFT, padx=4, pady=6)
-        self.save_excel_button = tk.Button(tab_file, text="Сохранить Excel",
-                                           command=self.save_excel_file, state=tk.DISABLED)
-        self.save_excel_button.pack(side=tk.LEFT, padx=4, pady=6)
-        self.save_as_sheet_button = tk.Button(tab_file, text="Сохранить как лист",
-                                              command=self.save_current_table_as_sheet,
-                                              state=tk.DISABLED, bg="green", fg="white")
-        self.save_as_sheet_button.pack(side=tk.LEFT, padx=4, pady=6)
-        self.clear_button = tk.Button(tab_file, text="Очистить (закрыть файл)",
-                                      command=self.clear_data, bg="red", fg="white")
-        self.clear_button.pack(side=tk.LEFT, padx=4, pady=6)
+        # --- Меню «Функции» ---
+        func_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Функции", menu=func_menu)
+        func_menu.add_command(label="Добавить критерии", command=self.add_criteria)
 
-        # --- Вкладка «Таблица» ---
-        tab_table = _make_tab("Таблица")
-        self.reset_filter_button = tk.Button(tab_table, text="Сбросить все фильтры",
-                                             command=self.reset_all_filters, state=tk.DISABLED)
-        self.reset_filter_button.pack(side=tk.LEFT, padx=4, pady=6)
-        tk.Button(tab_table, text="+ Столбец",
-                  command=self.add_column_dialog).pack(side=tk.LEFT, padx=4, pady=6)
-        tk.Button(tab_table, text="+ Строка",
-                  command=self.add_row).pack(side=tk.LEFT, padx=4, pady=6)
-        tk.Button(tab_table, text="Поиск",
-                  command=self.search_dialog).pack(side=tk.LEFT, padx=4, pady=6)
-        tk.Button(tab_table, text="Замена",
-                  command=self.replace_dialog).pack(side=tk.LEFT, padx=4, pady=6)
-        self.config_button = tk.Button(tab_table, text="Настроить таблицу",
-                                       command=self.configure_table, state=tk.DISABLED)
-        self.config_button.pack(side=tk.LEFT, padx=4, pady=6)
+        # --- Меню «Обновления» ---
+        upd_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Обновления", menu=upd_menu)
+        upd_menu.add_command(label="Проверить обновления", command=self.check_updates_manual)
+        upd_menu.add_separator()
+        upd_menu.add_command(label=f"Текущая версия: {__version__}", state=tk.DISABLED)
 
-        # --- Вкладка «Функции» ---
-        tab_func = _make_tab("Функции")
-        self.add_criteria_button = tk.Button(tab_func, text="Добавить критерии",
-                                             command=self.add_criteria, state=tk.NORMAL,
-                                             bg="orange", fg="white")
-        self.add_criteria_button.pack(side=tk.LEFT, padx=4, pady=6)
-
-        # --- Вкладка «Обновления» ---
-        tab_upd = _make_tab("Обновления")
-        self.check_updates_button = tk.Button(tab_upd, text="Проверить обновления",
-                                              command=self.check_updates_manual)
-        self.check_updates_button.pack(side=tk.LEFT, padx=4, pady=6)
-        tk.Label(tab_upd, text=f"Текущая версия: {__version__}",
-                 fg="#555555").pack(side=tk.LEFT, padx=(12, 4), pady=6)
+        # Прокси-объекты, чтобы существующий код вида self.xxx_button.config(state=...)
+        # продолжал работать, управляя пунктами меню.
+        self.load_button = _MenuItemProxy(file_menu, "Загрузить Excel")
+        self.save_excel_button = _MenuItemProxy(file_menu, "Сохранить Excel")
+        self.save_as_sheet_button = _MenuItemProxy(file_menu, "Сохранить как лист")
+        self.clear_button = _MenuItemProxy(file_menu, "Очистить (закрыть файл)")
+        self.reset_filter_button = _MenuItemProxy(table_menu, "Сбросить все фильтры")
+        self.config_button = _MenuItemProxy(table_menu, "Настроить таблицу")
+        self.add_criteria_button = _MenuItemProxy(func_menu, "Добавить критерии")
+        self.check_updates_button = _MenuItemProxy(upd_menu, "Проверить обновления")
 
         # ==== Строка прогресса и статуса ====
         status_frame = tk.Frame(main_frame)
@@ -738,6 +732,66 @@ class ExcelViewerApp:
         window.ci_category_cb.set("")
         window.ci_group_cb.set("(весь набор данных)")
 
+    @staticmethod
+    def _round_half_up(x, ndigits):
+        """Округление по стандартным математическим правилам (0.5 -> вверх),
+        в отличие от встроенного round(), который округляет к чётному."""
+        try:
+            q = Decimal(1).scaleb(-int(ndigits))          # 10^(-ndigits)
+            return float(Decimal(str(float(x))).quantize(q, rounding=ROUND_HALF_UP))
+        except Exception:
+            return round(float(x), int(ndigits))
+
+    def _ask_decimals(self, title="Знаки после запятой", default=2, minv=0, maxv=6):
+        """Модальное окно со счётчиком (Spinbox) для выбора числа знаков после
+        запятой. Возвращает int или None, если пользователь отменил."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title(title)
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        result = {"value": None}
+
+        tk.Label(dlg, text="Количество знаков после запятой:").grid(
+            row=0, column=0, padx=12, pady=(14, 6), sticky="w")
+        var = tk.IntVar(value=default)
+        spin = tk.Spinbox(dlg, from_=minv, to=maxv, textvariable=var,
+                          width=5, justify="center", font=("Arial", 11))
+        spin.grid(row=0, column=1, padx=(6, 12), pady=(14, 6))
+
+        btns = tk.Frame(dlg)
+        btns.grid(row=1, column=0, columnspan=2, pady=(6, 12))
+
+        def ok(_=None):
+            try:
+                v = int(float(var.get()))
+            except Exception:
+                v = default
+            result["value"] = max(minv, min(maxv, v))
+            dlg.destroy()
+
+        def cancel(_=None):
+            result["value"] = None
+            dlg.destroy()
+
+        tk.Button(btns, text="OK", width=8, command=ok,
+                  bg="green", fg="white").pack(side=tk.LEFT, padx=6)
+        tk.Button(btns, text="Отмена", width=8, command=cancel).pack(side=tk.LEFT, padx=6)
+        dlg.bind("<Return>", ok)
+        dlg.bind("<Escape>", cancel)
+
+        # Центрируем относительно главного окна
+        dlg.update_idletasks()
+        try:
+            x = self.root.winfo_rootx() + (self.root.winfo_width() - dlg.winfo_width()) // 2
+            y = self.root.winfo_rooty() + (self.root.winfo_height() - dlg.winfo_height()) // 2
+            dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            pass
+        spin.focus_set()
+        dlg.grab_set()
+        self.root.wait_window(dlg)
+        return result["value"]
+
     def add_result_table(self, df, window, kind):
         """Считает таблицу (медианы или частоты) и добавляет её блоком в стек результатов."""
         qual_selected = self._selected_columns(window.qual_table)
@@ -749,7 +803,10 @@ class ExcelViewerApp:
             return
 
         if kind == "mean":
-            columns, rows = self._compute_mean_rows(df, qual_selected, quant_selected)
+            decimals = self._ask_decimals(title="Отклонения (M ± SD): округление", default=2)
+            if decimals is None:
+                return  # пользователь отменил
+            columns, rows = self._compute_mean_rows(df, qual_selected, quant_selected, decimals)
             title = "M±SD: " + ", ".join(quant_selected) + "  |  группы: " + ", ".join(qual_selected)
             group_defs = []
             for col in qual_selected:
@@ -759,7 +816,8 @@ class ExcelViewerApp:
             block = {"kind": "quant", "kind_label": "Среднее (M ± SD)", "no_p": True,
                      "value_header": "M ± SD", "title": title, "columns": columns, "rows": rows,
                      "quant_features": list(quant_selected), "group_defs": group_defs,
-                     "small_features": set(), "group_counts": {}, "p_results": []}
+                     "small_features": set(), "group_counts": {}, "p_results": [],
+                     "decimals": decimals}
             window.result_blocks.append(block)
             self._render_block(window, block)
             return
@@ -1398,9 +1456,11 @@ class ExcelViewerApp:
             rows.append(row_data)
         return columns, rows, small_features, group_counts
 
-    def _compute_mean_rows(self, df, qual_selected, quant_selected):
+    def _compute_mean_rows(self, df, qual_selected, quant_selected, decimals=None):
         """Возвращает (columns, rows) для таблицы среднее ± стандартное отклонение (M ± SD).
-        Только для количественных признаков-строк."""
+        Только для количественных признаков-строк.
+        Если задан decimals — числа округляются по стандартным математическим
+        правилам до указанного числа знаков и выводятся с фиксированной точностью."""
         qual_unique_values = {}
         for col in qual_selected:
             uv = df[col].dropna().astype(str).unique()
@@ -1427,18 +1487,35 @@ class ExcelViewerApp:
                             vals = filtered[quant_col].astype(float).to_numpy()
                             m = float(np.mean(vals))
                             sd = float(np.std(vals, ddof=1)) if n >= 2 else 0.0
-                            cells.append({"count": n, "mean": round(m, 4), "sd": round(sd, 4)})
+                            cells.append({"count": n, "mean": round(m, 4), "sd": round(sd, 4),
+                                          "mean_raw": m, "sd_raw": sd})
                     except Exception as e:
                         print(f"Error mean {quant_col} {col}={val}: {e}")
                         cells.append("ошибка")
-            # выравнивание числа знаков по всем M и SD строки (правило «пятёрки»)
+
+            row_data = [quant_col]
+            if decimals is not None:
+                # Фиксированная точность: округляем по правилу «половина вверх»
+                for c in cells:
+                    if isinstance(c, dict):
+                        row_data.append(str(c["count"]))
+                        mtxt = f"{self._round_half_up(c['mean_raw'], decimals):.{decimals}f}"
+                        sdtxt = f"{self._round_half_up(c['sd_raw'], decimals):.{decimals}f}"
+                        row_data.append(f"{mtxt} ± {sdtxt}")
+                    elif c == "ошибка":
+                        row_data.extend(["ошибка", "ошибка"])
+                    else:
+                        row_data.extend(["0", "-"])
+                rows.append(row_data)
+                continue
+
+            # Автоматическое выравнивание числа знаков (старое поведение)
             parts = []
             for c in cells:
                 if isinstance(c, dict):
                     parts += [self._dec_parts(c["mean"]), self._dec_parts(c["sd"])]
             width = max((self._contribution(fr) for ip, fr in parts), default=0)
 
-            row_data = [quant_col]
             for c in cells:
                 if isinstance(c, dict):
                     row_data.append(str(c["count"]))
@@ -1540,6 +1617,7 @@ class ExcelViewerApp:
         tv.tag_configure('oddrow', background='#f0f0f0')
         tv.pack(side=tk.TOP, fill=tk.X)
         xbar.config(command=tv.xview)
+        self._attach_cell_copy(tv)
 
         if block["kind"] == "count" and block.get("ci"):
             tk.Label(frame, text=block["ci"]["text"], font=("Arial", 9),
@@ -1547,6 +1625,52 @@ class ExcelViewerApp:
 
         # Перепривязываем колесо мыши на новые виджеты таблицы
         self._bind_results_wheel(window)
+
+    def _attach_cell_copy(self, tv):
+        """Позволяет копировать отдельное значение (ячейку) из итоговой таблицы:
+        ЛКМ выделяет ячейку, ПКМ — меню «Копировать значение / строку»,
+        Ctrl+C копирует выбранную ячейку. Treeview сам по себе умеет выделять
+        только строку целиком, поэтому копирование делаем вручную."""
+        menu = tk.Menu(tv, tearoff=0)
+        state = {"value": "", "row": []}
+
+        def pick(event):
+            row_id = tv.identify_row(event.y)
+            col_id = tv.identify_column(event.x)   # вид '#1', '#2', ...
+            if not row_id or not col_id:
+                return
+            try:
+                idx = int(col_id.replace("#", "")) - 1
+            except Exception:
+                return
+            vals = list(tv.item(row_id, "values"))
+            state["row"] = vals
+            state["value"] = str(vals[idx]) if 0 <= idx < len(vals) else ""
+
+        def copy_cell(_=None):
+            if state["value"] != "":
+                tv.clipboard_clear()
+                tv.clipboard_append(state["value"])
+
+        def copy_row(_=None):
+            if state["row"]:
+                tv.clipboard_clear()
+                tv.clipboard_append("\t".join(str(v) for v in state["row"]))
+
+        def popup(event):
+            pick(event)
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+        menu.add_command(label="Копировать значение", command=copy_cell)
+        menu.add_command(label="Копировать строку", command=copy_row)
+
+        tv.bind("<Button-1>", pick, add="+")
+        tv.bind("<Button-3>", popup, add="+")
+        tv.bind("<Control-c>", copy_cell, add="+")
+        tv.bind("<Control-C>", copy_cell, add="+")
 
     def _count_flat_rows(self, model, specs=None):
         """Преобразует модель частот в плоские строки для Treeview.
@@ -3512,13 +3636,37 @@ class ExcelViewerApp:
                 "Обновить сейчас?"):
             self._apply_update(info)
 
+    def _resolve_self_path(self):
+        """Абсолютный, нормализованный путь к текущему исполняемому .py-файлу.
+        На Windows рабочая папка и реальное расположение файла могут отличаться,
+        поэтому берём именно абсолютный путь модуля и проверяем его существование."""
+        candidates = []
+        g = globals().get("__file__")
+        if g:
+            candidates.append(g)
+        if sys.argv and sys.argv[0]:
+            candidates.append(sys.argv[0])
+        for c in candidates:
+            try:
+                p = os.path.normpath(os.path.abspath(c))
+                if os.path.isfile(p):
+                    return p
+            except Exception:
+                continue
+        # запасной вариант — первый кандидат как есть
+        if candidates:
+            return os.path.normpath(os.path.abspath(candidates[0]))
+        return None
+
     def _apply_update(self, info):
         """Заменяет текущий .py-файл содержимым из репозитория и предлагает
         перезапустить приложение."""
-        try:
-            target = os.path.abspath(__file__)
-        except NameError:
-            target = os.path.abspath(sys.argv[0])
+        target = self._resolve_self_path()
+        if not target or not os.path.isfile(target):
+            messagebox.showerror(
+                "Ошибка обновления",
+                "Не удалось определить путь к файлу приложения для обновления.")
+            return
         try:
             # Резервная копия на случай сбоя
             backup = target + ".bak"
@@ -3542,14 +3690,32 @@ class ExcelViewerApp:
                 "Обновление установлено",
                 f"Обновление до версии {info['version']} установлено.\n"
                 "Перезапустить приложение сейчас?"):
-            try:
-                python = sys.executable
-                os.execl(python, python, target, *sys.argv[1:])
-            except Exception:
-                messagebox.showinfo(
-                    "Перезапуск",
-                    "Не удалось перезапустить автоматически.\n"
-                    "Закройте и запустите приложение заново.")
+            self._restart_app(target)
+
+    def _restart_app(self, target):
+        """Запускает новый экземпляр приложения и закрывает текущий.
+        Используется subprocess вместо os.execl — так надёжнее на Windows
+        (os.execl там часто даёт 'No such file or directory')."""
+        try:
+            python = sys.executable
+            # Рабочую папку выставляем в папку скрипта, чтобы относительные пути
+            # внутри приложения работали независимо от места запуска.
+            workdir = os.path.dirname(target) or None
+            args = [python, target] + list(sys.argv[1:])
+            subprocess.Popen(args, cwd=workdir, close_fds=False)
+        except Exception as e:
+            messagebox.showinfo(
+                "Перезапуск",
+                "Обновление установлено, но перезапустить автоматически не удалось.\n"
+                "Закройте и запустите приложение заново.\n\n"
+                f"Причина: {e}")
+            return
+        # Корректно закрываем текущий процесс
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        os._exit(0)
     # =============================================================
 
     def run(self):
