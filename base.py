@@ -23,7 +23,7 @@ import urllib.error
 #  Достаточно менять __version__ и пушить обновлённый файл в ветку —
 #  публиковать релизы не требуется.
 # --------------------------------------------------------------------------
-__version__ = "1.0.2"                 # текущая версия приложения (увеличивайте при каждом обновлении)
+__version__ = "1.0.3"                 # текущая версия приложения (увеличивайте при каждом обновлении)
 GITHUB_OWNER = "Easyzet"             # владелец репозитория на GitHub
 GITHUB_REPO = "base__4"              # имя репозитория
 GITHUB_BRANCH = "main"               # ветка, из которой берётся обновление (обычно main или master)
@@ -360,41 +360,53 @@ class ExcelViewerApp:
             self._highlight_active_column()
 
         def _yscroll(*a):
-            v_scrollbar.set(*a)
+            # Вертикальная прокрутка виджета не используется напрямую —
+            # положение задаёт виртуализация, ползунок выставляется вручную.
             self._highlight_active_column()
 
         self.table.configure(xscrollcommand=_xscroll, yscrollcommand=_yscroll)
-        self.table.bind("<Configure>", lambda e: self._highlight_active_column())
-        
+        self.table.bind("<Configure>", self._on_table_configure)
+
         # Настройка цветов строк для полосатости
         self.table.tag_configure('oddrow', background='#f0f0f0')
         self.table.tag_configure('evenrow', background='white')
-        
+
         h_scrollbar.config(command=self.table.xview)
-        v_scrollbar.config(command=self.table.yview)
-        
+        # Вертикальный ползунок управляет виртуальным окном (а не yview виджета)
+        v_scrollbar.config(command=self._virt_yview)
+
+        # Состояние виртуализации (окно строк в большом наборе данных)
+        self._virt_total = 0
+        self._virt_start = 0
+        self._virt_visible = 40
+        self._virt_window = 42
+        self._virt_painting = False
+
         # Привязки: ЛКМ по заголовку — фильтр; ПКМ по заголовку — меню столбца;
         # двойной клик по ячейке — правка.
         self.table.bind('<Button-1>', self.on_table_left)
         self.table.bind('<Button-3>', self.on_table_right)
         self.table.bind('<Double-1>', self.on_table_double)
 
-        # Прокрутка колёсиком мыши, когда курсор находится над таблицей.
-        # Работает на Windows/macOS (<MouseWheel>) и Linux (<Button-4>/<Button-5>).
+        # Прокрутка колёсиком: сдвигает виртуальное окно и перерисовывает
+        # (перерисовывается лишь ~видимое число строк, поэтому это быстро).
         def _table_wheel(event):
-            if getattr(event, "num", None) == 4:          # Linux — вверх
-                self.table.yview_scroll(-1, "units")
-            elif getattr(event, "num", None) == 5:        # Linux — вниз
-                self.table.yview_scroll(1, "units")
-            elif event.delta:                             # Windows/macOS
-                step = -1 if event.delta > 0 else 1
-                if abs(event.delta) >= 120:               # Windows — кратно 120
-                    step = int(-event.delta / 120)
-                self.table.yview_scroll(step, "units")
+            step = 0
+            if getattr(event, "num", None) == 4:            # Linux вверх
+                step = -3
+            elif getattr(event, "num", None) == 5:          # Linux вниз
+                step = 3
+            elif event.delta:                               # Windows/macOS
+                if abs(event.delta) >= 120:
+                    step = int(-event.delta / 120) * 3
+                else:
+                    step = (-1 if event.delta > 0 else 1) * 3
+            if step:
+                self._virt_start += step
+                self._virt_paint()
             return "break"
 
-        # Активируем колесо только когда курсор над таблицей, чтобы не мешать
-        # прокрутке остальных областей.
+        # Активируем колесо только когда курсор над таблицей.
         def _bind_wheel(_=None):
             self.table.bind_all("<MouseWheel>", _table_wheel)
             self.table.bind_all("<Button-4>", _table_wheel)
@@ -407,6 +419,11 @@ class ExcelViewerApp:
 
         self.table.bind("<Enter>", _bind_wheel)
         self.table.bind("<Leave>", _unbind_wheel)
+        # Прокрутка клавиатурой
+        self.table.bind("<Prior>", lambda e: self._virt_page(-1))   # PageUp
+        self.table.bind("<Next>", lambda e: self._virt_page(1))     # PageDown
+        self.table.bind("<Home>", lambda e: self._virt_goto(0))
+        self.table.bind("<End>", lambda e: self._virt_goto(10 ** 12))
         
         # Правая панель (данные столбца)
         right_frame = tk.Frame(work_frame, width=200)
@@ -2457,9 +2474,9 @@ class ExcelViewerApp:
         if hasattr(self, "last_action_label"):
             self.last_action_label.config(text=text)
 
-    def _render_main_table(self, action=None, prev_rows=None):
-        """Перерисовывает таблицу с учётом фильтров; iid строки = индекс df.
-        action/prev_rows — для сообщения о последнем действии (по числу строк)."""
+    def _render_main_table(self, action=None, prev_rows=None, preserve_pos=False):
+        """Перерисовывает таблицу с учётом фильтров (виртуализация: в виджет
+        вставляется только видимое окно строк). iid строки = индекс df."""
         self._cancel_cell_edit()
         self._clear_col_highlight()
         if self.df_full is None:
@@ -2477,18 +2494,17 @@ class ExcelViewerApp:
         for col in cols:
             self.table.heading(col, text=self._heading_text(col))
             self.table.column(col, width=110, minwidth=50)
-        n = 0
-        for pos, (idx, row) in enumerate(view.head(3000).iterrows()):
-            values = [self._cell_str(v) for v in row]
-            tag = 'evenrow' if pos % 2 == 0 else 'oddrow'
-            self.table.insert('', tk.END, iid=str(idx), text=str(pos + 1),
-                              values=values, tags=(tag,))
-            n += 1
-        total = len(view)
+
+        # Состояние виртуализации
+        self._virt_total = len(self.current_displayed_df)
+        if not preserve_pos:
+            self._virt_start = 0
+        self._virt_paint()
+
+        total = self._virt_total
         self.reset_filter_button.config(state=(tk.NORMAL if self.col_filters else tk.DISABLED))
         if hasattr(self, "rowcount_label"):
-            extra = "" if total <= 3000 else f" (показано {n})"
-            self.rowcount_label.config(text=f"Строк: {total}{extra}")
+            self.rowcount_label.config(text=f"Строк: {total}")
         if action and prev_rows is not None:
             after = total
             if action == "filter":
@@ -2499,9 +2515,133 @@ class ExcelViewerApp:
                 self._set_last_action(f"Удалено {prev_rows - after} строк. {prev_rows} → {after}")
             elif action == "add":
                 self._set_last_action(f"Добавлена строка. {prev_rows} → {after}")
-        if self._active_col in cols:
-            self.table.after(1, self._highlight_active_column)
         self._update_filter_status()
+
+    # ---------- Виртуализация большой таблицы ----------
+    def _virt_calc_window(self):
+        """Определяет число видимых строк по высоте виджета."""
+        try:
+            h = self.table.winfo_height()
+        except Exception:
+            h = 0
+        rh = 25  # rowheight из стиля Treeview
+        if h and h > rh:
+            vis = max(5, int((h - rh) / rh))
+        else:
+            vis = getattr(self, "_virt_visible", 40)
+        self._virt_visible = vis
+        self._virt_window = vis + 2   # небольшой буфер снизу
+
+    def _virt_paint(self):
+        """Отрисовывает текущее окно строк [start, start+window)."""
+        if self._virt_painting:
+            return
+        view = self.current_displayed_df
+        if view is None:
+            return
+        self._virt_painting = True
+        try:
+            self._virt_calc_window()
+            total = self._virt_total
+            window = self._virt_window
+            # Ограничиваем стартовую позицию допустимым диапазоном
+            max_start = max(0, total - self._virt_visible)
+            start = min(max(0, self._virt_start), max_start)
+            self._virt_start = start
+            end = min(total, start + window)
+
+            self.table.delete(*self.table.get_children())
+            if total > 0:
+                sub = view.iloc[start:end]
+                pos = start
+                for idx, row in sub.iterrows():
+                    values = [self._cell_str(v) for v in row]
+                    tag = 'evenrow' if pos % 2 == 0 else 'oddrow'
+                    self.table.insert('', tk.END, iid=str(idx), text=str(pos + 1),
+                                      values=values, tags=(tag,))
+                    pos += 1
+
+            # Ползунок выставляем вручную (представляет весь набор данных)
+            if total > 0:
+                first = start / total
+                last = min(1.0, (start + self._virt_visible) / total)
+            else:
+                first, last = 0.0, 1.0
+            try:
+                self.v_scrollbar.set(first, last)
+            except Exception:
+                pass
+            # Прижимаем внутренний вид виджета к верху (окно = верх видимой области)
+            try:
+                self.table.yview_moveto(0.0)
+            except Exception:
+                pass
+        finally:
+            self._virt_painting = False
+        if self._active_col in list(self.table['columns']):
+            self.table.after(1, self._highlight_active_column)
+
+    def _virt_yview(self, *args):
+        """Команда вертикального ползунка: moveto / scroll."""
+        if not args or self.df_full is None:
+            return
+        total = getattr(self, "_virt_total", 0)
+        vis = getattr(self, "_virt_visible", 40)
+        op = args[0]
+        if op == "moveto":
+            try:
+                frac = float(args[1])
+            except Exception:
+                return
+            self._virt_start = int(round(frac * total))
+        elif op == "scroll":
+            try:
+                amount = int(float(args[1]))
+            except Exception:
+                return
+            what = args[2] if len(args) > 2 else "units"
+            if what == "pages":
+                self._virt_start += amount * max(1, vis - 1)
+            else:
+                self._virt_start += amount * 3
+        self._virt_paint()
+
+    def _on_table_configure(self, event=None):
+        """При изменении размера пересчитываем окно и перерисовываем."""
+        if self.df_full is not None and self.current_displayed_df is not None:
+            self._virt_paint()
+        else:
+            self._highlight_active_column()
+
+    def _virt_page(self, direction):
+        vis = getattr(self, "_virt_visible", 40)
+        self._virt_start += direction * max(1, vis - 1)
+        self._virt_paint()
+        return "break"
+
+    def _virt_goto(self, pos):
+        """Прокрутить так, чтобы позиция pos (номер строки в отфильтрованном
+        наборе) была видна вверху окна."""
+        self._virt_start = int(pos)
+        self._virt_paint()
+        return "break"
+
+    def _virt_scroll_to_index(self, idx):
+        """Прокручивает к строке с индексом df=idx и возвращает её iid (или None)."""
+        view = self.current_displayed_df
+        if view is None:
+            return None
+        try:
+            pos = view.index.get_loc(idx)
+        except Exception:
+            return None
+        if isinstance(pos, slice):
+            pos = pos.start or 0
+        # ставим строку чуть ниже верхней границы окна
+        self._virt_start = max(0, int(pos) - 2)
+        self._virt_paint()
+        return str(idx)
+
 
     # ---------- определение столбца/строки по клику ----------
     def _col_at(self, event):
@@ -2930,8 +3070,11 @@ class ExcelViewerApp:
         self.df_full.loc[len(self.df_full)] = ["" for _ in self.df_full.columns]
         self.df_full = self.df_full.reset_index(drop=True)
         self._render_main_table(action="add", prev_rows=prev)
+        # Прокручиваем к последней (новой) строке
+        self._virt_goto(max(0, self._virt_total - self._virt_visible))
         kids = self.table.get_children()
         if kids:
+            self.table.selection_set(kids[-1])
             self.table.see(kids[-1])
 
     # ---------- Правка ячейки ----------
@@ -3008,52 +3151,69 @@ class ExcelViewerApp:
         tk.Button(btns, text="Закрыть", command=dlg.destroy).pack(side=tk.RIGHT)
         entry.bind("<Return>", lambda e: self._find_next(entry.get(), scope.get()))
 
-    def _search_targets(self, scope):
-        """Список (iid, col) для поиска в заданной области (по видимым строкам)."""
-        cols = list(self.table['columns'])
-        rows = list(self.table.get_children())
-        targets = []
-        if scope == "row":
-            sel = self.table.selection()
-            rows = [r for r in rows if r in sel] or rows
-            for r in rows:
-                for c in cols:
-                    targets.append((r, c))
-        elif scope == "col" and self._active_col in cols:
-            for r in rows:
-                targets.append((r, self._active_col))
-        else:
-            for r in rows:
-                for c in cols:
-                    targets.append((r, c))
-        return targets
-
     def _find_next(self, text, scope):
-        if not text:
+        if not text or self.current_displayed_df is None:
             return
-        targets = self._search_targets(scope)
-        if not targets:
+        view = self.current_displayed_df
+        cols = list(view.columns)
+        n = len(view)
+        if n == 0:
             return
+        tl = text.lower()
+
+        # Область поиска: столбцы и позиции строк в отфильтрованном наборе
+        if scope == "col" and self._active_col in cols:
+            search_cols = [self._active_col]
+            row_pos = list(range(n))
+        elif scope == "row":
+            sel = [int(i) for i in self.table.selection() if str(i).lstrip('-').isdigit()]
+            positions = []
+            for idx in sel:
+                try:
+                    positions.append(view.index.get_loc(idx))
+                except Exception:
+                    pass
+            row_pos = sorted(positions) if positions else list(range(n))
+            search_cols = cols
+        else:
+            search_cols = cols
+            row_pos = list(range(n))
+
+        col_pos = [cols.index(c) for c in search_cols]
+        ncols = len(col_pos)
+        flat_len = len(row_pos) * ncols
+        if flat_len == 0:
+            return
+
         st = self._search_state
         start = 0
         if st and st.get("text") == text and st.get("scope") == scope:
-            start = st["pos"] + 1
+            start = st["flat"] + 1
+
+        vals = view.values
         found = None
-        for i in range(start, len(targets) + start):
-            iid, col = targets[i % len(targets)]
-            val = self.table.set(iid, col)
-            if text.lower() in str(val).lower():
-                found = (i % len(targets), iid, col)
+        for k in range(start, start + flat_len):
+            i = k % flat_len
+            rp = row_pos[i // ncols]
+            cp = col_pos[i % ncols]
+            if tl in self._cell_str(vals[rp][cp]).lower():
+                found = (i, rp)
                 break
         if found is None:
             messagebox.showinfo("Поиск", "Совпадений не найдено")
             self._search_state = None
             return
-        pos, iid, col = found
-        self._search_state = {"text": text, "scope": scope, "pos": pos}
-        self.table.selection_set(iid)
-        self.table.focus(iid)
-        self.table.see(iid)
+        flat_i, rp = found
+        self._search_state = {"text": text, "scope": scope, "flat": flat_i}
+        idx = view.index[rp]
+        iid = self._virt_scroll_to_index(idx)
+        if iid is not None:
+            try:
+                self.table.selection_set(iid)
+                self.table.focus(iid)
+                self.table.see(iid)
+            except Exception:
+                pass
 
     # ---------- Замена (regex) ----------
     def replace_dialog(self):
@@ -3090,17 +3250,19 @@ class ExcelViewerApp:
             messagebox.showerror("Регулярное выражение", f"Ошибка в шаблоне: {e}")
             return
         cols = list(self.df_full.columns)
+        view = self.current_displayed_df if self.current_displayed_df is not None else self.df_full
+        view_idxs = list(view.index)
         # какие столбцы и строки затрагиваем
         if scope == "col" and self._active_col in cols:
             target_cols = [self._active_col]
-            idxs = [int(i) for i in self.table.get_children()]
+            idxs = view_idxs
         elif scope == "sel":
             sel = self.table.selection()
-            idxs = [int(i) for i in sel] if sel else [int(i) for i in self.table.get_children()]
+            idxs = [int(i) for i in sel] if sel else view_idxs
             target_cols = [self._active_col] if self._active_col in cols else cols
         else:
             target_cols = cols
-            idxs = [int(i) for i in self.table.get_children()]
+            idxs = view_idxs
         count = 0
         for idx in idxs:
             for col in target_cols:
