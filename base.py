@@ -23,7 +23,7 @@ import urllib.error
 #  Достаточно менять __version__ и пушить обновлённый файл в ветку —
 #  публиковать релизы не требуется.
 # --------------------------------------------------------------------------
-__version__ = "1.0.3"                 # текущая версия приложения (увеличивайте при каждом обновлении)
+__version__ = "1.0.4"                 # текущая версия приложения (увеличивайте при каждом обновлении)
 GITHUB_OWNER = "Easyzet"             # владелец репозитория на GitHub
 GITHUB_REPO = "base__4"              # имя репозитория
 GITHUB_BRANCH = "main"               # ветка, из которой берётся обновление (обычно main или master)
@@ -2557,7 +2557,13 @@ class ExcelViewerApp:
                 for idx, row in sub.iterrows():
                     values = [self._cell_str(v) for v in row]
                     tag = 'evenrow' if pos % 2 == 0 else 'oddrow'
-                    self.table.insert('', tk.END, iid=str(idx), text=str(pos + 1),
+                    # Номер строки = исходный индекс строки (сохраняется при фильтрации),
+                    # а не порядковый номер в отфильтрованном наборе.
+                    try:
+                        row_no = int(idx) + 1
+                    except (TypeError, ValueError):
+                        row_no = pos + 1
+                    self.table.insert('', tk.END, iid=str(idx), text=str(row_no),
                                       values=values, tags=(tag,))
                     pos += 1
 
@@ -3324,17 +3330,20 @@ class ExcelViewerApp:
             # Переменная для отслеживания максимальной длины текста
             max_text_length = 0
             
-            # Добавляем все значения, включая пустые
-            for index, value in enumerate(column_data.head(500)):  # Ограничиваем для производительности
-                row_num = index + 1
-                
+            # Добавляем все значения, включая пустые (номер строки = исходный индекс)
+            for pos_i, (index, value) in enumerate(column_data.head(500).items()):
+                try:
+                    row_num = int(index) + 1
+                except (TypeError, ValueError):
+                    row_num = pos_i + 1
+
                 # Обрабатываем пустые значения
                 if pd.isna(value) or value == '' or str(value).strip() == '':
                     display_value = ""  # Пустая строка для пустых значений
                     tag = 'empty_row'
                 else:
                     display_value = str(value)
-                    tag = 'evenrow' if index % 2 == 0 else 'oddrow'
+                    tag = 'evenrow' if pos_i % 2 == 0 else 'oddrow'
                     # Обновляем максимальную длину
                     max_text_length = max(max_text_length, len(display_value))
                 
