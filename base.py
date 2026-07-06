@@ -23,7 +23,7 @@ import urllib.error
 #  Достаточно менять __version__ и пушить обновлённый файл в ветку —
 #  публиковать релизы не требуется.
 # --------------------------------------------------------------------------
-__version__ = "1.0.4"                 # текущая версия приложения (увеличивайте при каждом обновлении)
+__version__ = "1.0.6"                 # текущая версия приложения (увеличивайте при каждом обновлении)
 GITHUB_OWNER = "Easyzet"             # владелец репозитория на GitHub
 GITHUB_REPO = "base__4"              # имя репозитория
 GITHUB_BRANCH = "main"               # ветка, из которой берётся обновление (обычно main или master)
@@ -977,8 +977,9 @@ class ExcelViewerApp:
         add_combo(1)
         tk.Button(cols_frame, text="+  Добавить столбец",
                   command=lambda: add_combo(min(len(col_combos), len(labels) - 1))).pack(anchor="w", padx=4, pady=2)
-        tk.Label(cols_frame, text="(Фишер — два столбца; хи-квадрат — два и больше через «+»)",
-                 fg="#555555").pack(anchor="w", padx=4)
+        tk.Label(cols_frame, text="(Фишер: 2 столбца; 3 и более — автоматически критерий "
+                                  "Фишера-Фримена-Холтона. Хи-квадрат — 2 и больше через «+».)",
+                 fg="#555555", wraplength=520, justify="left").pack(anchor="w", padx=4)
 
         four_var = tk.BooleanVar(value=False)
         tk.Checkbutton(content, text="Показывать p с 4 знаками после запятой",
@@ -1008,9 +1009,9 @@ class ExcelViewerApp:
                     messagebox.showwarning("Столбцы", "Выберите минимум два РАЗНЫХ столбца")
                     return
             else:
-                if len(picked) != 2:
-                    messagebox.showwarning("Столбцы",
-                                           "Для точного критерия Фишера нужно ровно два РАЗНЫХ столбца")
+                # Фишер (2 столбца) ↔ Фишера-Фримена-Холтона (3 и более) — авто-переход
+                if len(picked) < 2:
+                    messagebox.showwarning("Столбцы", "Выберите минимум два РАЗНЫХ столбца")
                     return
             four = four_var.get()
             res_pv, res_cr = {}, {}
@@ -1021,10 +1022,17 @@ class ExcelViewerApp:
                 if chi:
                     res_pv[f["name"]] = self._fmt_pvalue(self._chi2_test(table), four=four)
                     res_cr[f["name"]] = "Критерий хи-квадрат"
-                else:
+                elif len(picked) == 2:
                     res_pv[f["name"]] = self._fmt_pvalue(self._fisher_exact_2col(table), four=four)
                     res_cr[f["name"]] = ("Точный двусторонний критерий Фишера" if len(table) == 2
                                          else "Критерий Фишера-Фримена-Холтона")
+                else:
+                    # 3 и более столбцов — критерий Фишера-Фримена-Холтона (Монте-Карло)
+                    res_pv[f["name"]] = self._fmt_pvalue(self._fisher_freeman_halton_p(table), four=four)
+                    res_cr[f["name"]] = "Критерий Фишера-Фримена-Холтона"
+            # Строки, исключённые из расчёта, помечаем «-» (а не пусто)
+            for f in model["features"]:
+                res_pv.setdefault(f["name"], "-")
             block.setdefault("p_results", []).append(
                 {"pvalues": res_pv, "p_criteria": res_cr,
                  "compared": tuple(groups[gi]["value"] for gi in picked)})
@@ -1262,16 +1270,29 @@ class ExcelViewerApp:
         btns.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=8)
         content = self._scrollable_area(dlg)
 
-        # --- Критерий для расчёта p (галочка только на одном) ---
+        # --- Критерий: ручной выбор, но по умолчанию подставляется правильный
+        #     в зависимости от числа выбранных столбцов ---
         crit_frame = tk.LabelFrame(content, text="По какому критерию считать p",
                                    font=("Arial", 10, "bold"))
         crit_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
         crit_vars = {}
         criteria = ["Критерий Манна-Уитни", "Критерий Краскелла-Уоллиса"]
+        crit_state = {"touched": False}   # пользователь сам менял выбор?
 
-        def select_criterion(chosen):
+        def _distinct_picked():
+            lab2def = {g["label"]: g for g in groups}
+            picked = []
+            for cb in col_combos:
+                gd = lab2def.get(cb.get())
+                if gd and gd not in picked:
+                    picked.append(gd)
+            return picked
+
+        def select_criterion(chosen, by_user=True):
             for name, var in crit_vars.items():
                 var.set(name == chosen)
+            if by_user:
+                crit_state["touched"] = True
 
         for i, name in enumerate(criteria):
             v = tk.BooleanVar(value=(i == 0))
@@ -1279,6 +1300,17 @@ class ExcelViewerApp:
             tk.Checkbutton(crit_frame, text=name, variable=v,
                            command=lambda n=name: select_criterion(n),
                            anchor="w").pack(fill=tk.X, padx=6)
+        tk.Label(crit_frame,
+                 text="Подставляется автоматически: 2 столбца → Манна-Уитни, 3 и более → Краскелла-Уоллиса.",
+                 fg="#555555", anchor="w").pack(fill=tk.X, padx=6)
+
+        def update_crit_indicator(*_):
+            # Пока пользователь не выбрал критерий вручную — подставляем по числу столбцов
+            if crit_state["touched"]:
+                return
+            n = len(_distinct_picked())
+            select_criterion("Критерий Краскелла-Уоллиса" if n >= 3 else "Критерий Манна-Уитни",
+                             by_user=False)
 
         # --- Признаки-строки (по умолчанию все выбраны) ---
         rows_frame = tk.LabelFrame(content, text="Признаки (строки) для сравнения",
@@ -1307,24 +1339,30 @@ class ExcelViewerApp:
             cb.pack(side=tk.LEFT, padx=4)
             if default_idx is not None and default_idx < len(labels):
                 cb.current(default_idx)
+            cb.bind("<<ComboboxSelected>>", update_crit_indicator)
 
             def remove():
                 if len(col_combos) <= 2:
                     return
                 row.destroy()
                 col_combos.remove(cb)
+                update_crit_indicator()
 
             tk.Button(row, text="−", width=2, command=remove).pack(side=tk.LEFT)
             col_combos.append(cb)
 
-        add_combo(0)
-        add_combo(1)
+        # По умолчанию подставляем ВСЕ группы выбранного признака (сравниваем все
+        # столбцы). Если групп больше двух — критерий сам станет Краскелла-Уоллиса.
+        if len(labels) >= 2:
+            for i in range(len(labels)):
+                add_combo(i)
+        else:
+            add_combo(0)
+            add_combo(min(1, len(labels) - 1))
         tk.Button(cols_frame, text="+  Добавить столбец",
-                  command=lambda: add_combo(min(len(col_combos), len(labels) - 1))).pack(anchor="w", padx=4, pady=2)
-        if len(groups) == 2:
-            tk.Label(cols_frame, text="(для Манна-Уитни сравниваются два столбца; "
-                                      "для Краскелла-Уоллиса добавьте 3+ через «+»)",
-                     fg="#555555").pack(anchor="w", padx=4)
+                  command=lambda: (add_combo(min(len(col_combos), len(labels) - 1)),
+                                   update_crit_indicator())).pack(anchor="w", padx=4, pady=2)
+        update_crit_indicator()
 
         # Переключатель: показывать значения p с 4 знаками после запятой
         four_var = tk.BooleanVar(value=False)
@@ -1340,17 +1378,12 @@ class ExcelViewerApp:
                 messagebox.showwarning("Критерий", "Выберите критерий для расчёта p")
                 return
             criterion = chosen[0]
+            kw = (criterion == "Критерий Краскелла-Уоллиса")
             sel_feats = [f for f, v in feat_vars.items() if v.get()]
             if not sel_feats:
                 messagebox.showwarning("Признаки", "Выберите хотя бы один признак-строку")
                 return
-            lab2def = {g["label"]: g for g in groups}
-            picked = []
-            for cb in col_combos:
-                gd = lab2def.get(cb.get())
-                if gd and gd not in picked:
-                    picked.append(gd)
-            kw = (criterion == "Критерий Краскелла-Уоллиса")
+            picked = _distinct_picked()
             if kw:
                 if len(picked) < 2:
                     messagebox.showwarning("Столбцы", "Выберите минимум два РАЗНЫХ столбца")
@@ -1381,7 +1414,10 @@ class ExcelViewerApp:
                     p = self._mann_whitney_p(col_values(feat, picked[0]), col_values(feat, picked[1]))
                     res_cr[feat] = "Критерий Манна-Уитни"
                 res_pv[feat] = self._fmt_pvalue(p, four=four)
+            # Малочисленные и исключённые из расчёта строки → «-» (а не пусто)
             for feat in small:
+                res_pv.setdefault(feat, "-")
+            for feat in block.get("quant_features", []):
                 res_pv.setdefault(feat, "-")
             block.setdefault("p_results", []).append(
                 {"pvalues": res_pv, "p_criteria": res_cr,
@@ -2017,6 +2053,59 @@ class ExcelViewerApp:
 
         rec(0, C0, [])
         return min(1.0, total[0])
+
+    def _fisher_freeman_halton_p(self, table, nsim=100000, seed=20240607):
+        """Точный критерий Фишера-Фримена-Холтона для таблицы r×c (c столбцов ≥ 2).
+        p оценивается методом Монте-Карло (как в R fisher.test(simulate.p.value=TRUE)):
+        генерируются случайные таблицы с теми же суммами по строкам и столбцам,
+        и считается доля таблиц, вероятность которых не выше наблюдаемой.
+        Сид фиксирован — результат воспроизводим при одних и тех же данных."""
+        tab = [[int(x) for x in row] for row in table]
+        R = len(tab)
+        if R < 2:
+            return None
+        C = len(tab[0])
+        if C < 2 or any(len(row) != C for row in tab):
+            return None
+        row_sums = [sum(row) for row in tab]
+        col_sums = [sum(tab[i][j] for i in range(R)) for j in range(C)]
+        N = sum(row_sums)
+        if N == 0:
+            return None
+
+        lf = lambda n: math.lgamma(n + 1)
+        const = sum(lf(s) for s in row_sums) + sum(lf(s) for s in col_sums) - lf(N)
+        logp_obs = const - sum(lf(tab[i][j]) for i in range(R) for j in range(C))
+
+        rng = np.random.default_rng(seed)
+        lg = np.array([math.lgamma(n + 1) for n in range(N + 1)], dtype=np.float64)
+
+        logp = np.full(nsim, const, dtype=np.float64)
+        col_rem = np.tile(np.array(col_sums, dtype=np.int64), (nsim, 1))
+        for i in range(R):
+            r_rem = np.full(nsim, int(row_sums[i]), dtype=np.int64)
+            avail = col_rem.sum(axis=1)
+            for j in range(C - 1):
+                cj = col_rem[:, j]
+                nbad = avail - cj
+                x = np.zeros(nsim, dtype=np.int64)
+                m_draw = (r_rem > 0) & (cj > 0) & (nbad > 0)
+                if m_draw.any():
+                    x[m_draw] = rng.hypergeometric(cj[m_draw], nbad[m_draw], r_rem[m_draw])
+                m_all = (r_rem > 0) & (cj > 0) & (nbad <= 0)
+                if m_all.any():
+                    x[m_all] = np.minimum(r_rem[m_all], cj[m_all])
+                logp -= lg[x]
+                col_rem[:, j] -= x
+                r_rem -= x
+                avail -= cj
+            xlast = r_rem
+            logp -= lg[xlast]
+            col_rem[:, C - 1] -= xlast
+
+        EPS = 1e-7
+        count_le = int(np.count_nonzero(logp <= logp_obs + EPS))
+        return (1 + count_le) / (1 + nsim)
 
     # ---------- χ²-распределение и критерии для >2 групп ----------
     @staticmethod
