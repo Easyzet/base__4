@@ -23,7 +23,7 @@ import urllib.error
 #  Достаточно менять __version__ и пушить обновлённый файл в ветку —
 #  публиковать релизы не требуется.
 # --------------------------------------------------------------------------
-__version__ = "1.0.10"                 # текущая версия приложения (увеличивайте при каждом обновлении)
+__version__ = "1.0.11"                 # текущая версия приложения (увеличивайте при каждом обновлении)
 GITHUB_OWNER = "Easyzet"             # владелец репозитория на GitHub
 GITHUB_REPO = "base__4"              # имя репозитория
 GITHUB_BRANCH = "main"               # ветка, из которой берётся обновление (обычно main или master)
@@ -959,9 +959,11 @@ class ExcelViewerApp:
         groups = block["model"]["groups"]
         if len(groups) < 2:
             return  # для одной группы критерий не считается
+        owner = window if (window is not None and window.winfo_exists()) else self.root
         if not messagebox.askyesno(
                 "Столбец p",
-                "Заполнить столбец p по точному критерию Фишера?"):
+                "Заполнить столбец p по точному критерию Фишера?",
+                parent=owner):
             return
         self._open_count_pvalue_dialog(window, block)
 
@@ -1315,9 +1317,11 @@ class ExcelViewerApp:
 
     def _ask_and_fill_pvalues(self, df, window, block):
         """Спрашивает, заполнять ли столбец p, и при согласии открывает окно выбора."""
+        owner = window if (window is not None and window.winfo_exists()) else self.root
         if not messagebox.askyesno(
                 "Столбец p",
-                "Заполнить столбец p по критерию Манна-Уитни?"):
+                "Заполнить столбец p по критерию Манна-Уитни?",
+                parent=owner):
             return
         self._open_pvalue_dialog(df, window, block)
 
