@@ -23,7 +23,7 @@ import urllib.error
 #  Достаточно менять __version__ и пушить обновлённый файл в ветку —
 #  публиковать релизы не требуется.
 # --------------------------------------------------------------------------
-__version__ = "1.0.6"                 # текущая версия приложения (увеличивайте при каждом обновлении)
+__version__ = "1.0.8"                 # текущая версия приложения (увеличивайте при каждом обновлении)
 GITHUB_OWNER = "Easyzet"             # владелец репозитория на GitHub
 GITHUB_REPO = "base__4"              # имя репозитория
 GITHUB_BRANCH = "main"               # ветка, из которой берётся обновление (обычно main или master)
@@ -809,6 +809,38 @@ class ExcelViewerApp:
         self.root.wait_window(dlg)
         return result["value"]
 
+    def _nonnumeric_features(self, df, quant_selected):
+        """Возвращает список выбранных признаков-строк, которые содержат нечисловые
+        значения (по ним нельзя посчитать медиану / среднее)."""
+        bad = []
+        for qc in quant_selected:
+            if qc not in df.columns:
+                continue
+            ser = df[qc]
+            nonempty = ser[ser.notna() & (ser.astype(str).str.strip() != '')]
+            if len(nonempty) == 0:
+                continue
+            coerced = pd.to_numeric(nonempty, errors='coerce')
+            if coerced.isna().any():
+                bad.append(qc)
+        return bad
+
+    def _warn_nonnumeric(self, df, quant_selected, what):
+        """Показывает предупреждение, если среди признаков-строк есть нечисловые.
+        Возвращает True, если ВСЕ выбранные признаки нечисловые (считать нечего)."""
+        bad = self._nonnumeric_features(df, quant_selected)
+        if bad:
+            messagebox.showwarning(
+                "Нечисловые признаки",
+                f"{what} можно посчитать только для числовых признаков.\n\n"
+                "Эти признаки-строки содержат нечисловые (текстовые) значения, "
+                "поэтому в таблице по ним будет показано «ошибка»:\n\n• "
+                + "\n• ".join(bad) +
+                "\n\nВыберите числовые признаки или очистите/исправьте нечисловые "
+                "значения в этих столбцах. Для качественных признаков используйте "
+                "таблицу частот.")
+        return len(bad) == len(quant_selected) and len(bad) > 0
+
     def add_result_table(self, df, window, kind):
         """Считает таблицу (медианы или частоты) и добавляет её блоком в стек результатов."""
         qual_selected = self._selected_columns(window.qual_table)
@@ -820,6 +852,8 @@ class ExcelViewerApp:
             return
 
         if kind == "mean":
+            if self._warn_nonnumeric(df, quant_selected, "Среднее (M ± SD)"):
+                return  # все признаки нечисловые — считать нечего
             decimals = self._ask_decimals(title="Отклонения (M ± SD): округление", default=2)
             if decimals is None:
                 return  # пользователь отменил
@@ -840,6 +874,8 @@ class ExcelViewerApp:
             return
 
         if kind == "quant":
+            if self._warn_nonnumeric(df, quant_selected, "Медианы"):
+                return  # все признаки нечисловые — считать нечего
             columns, rows, small_features, group_counts = self._compute_quant_rows(
                 df, qual_selected, quant_selected)
             title = "Медианы: " + ", ".join(quant_selected) + "  |  группы: " + ", ".join(qual_selected)
@@ -1395,7 +1431,6 @@ class ExcelViewerApp:
                     return
             pv = self._pretty_value
             four = four_var.get()
-            small = block.get("small_features", set())
             res_pv, res_cr = {}, {}
 
             def col_values(feat, gd):
@@ -1403,20 +1438,22 @@ class ExcelViewerApp:
                           df[feat].notna() &
                           (df[feat].astype(str).str.strip() != '')][feat].astype(float).tolist()
 
+            SMALL_N = 4  # порог малочисленности (как в таблице: N<=4 — значения через «;»)
             for feat in sel_feats:
-                if feat in small:
+                group_vals = [col_values(feat, gd) for gd in picked]
+                # Признак исключается из расчёта («-»), только если малочисленна
+                # одна из СРАВНИВАЕМЫХ групп, а не любая группа таблицы.
+                if any(len(gv) <= SMALL_N for gv in group_vals):
                     res_pv[feat] = "-"
                     continue
                 if kw:
-                    p = self._kruskal_wallis_p([col_values(feat, gd) for gd in picked])
+                    p = self._kruskal_wallis_p(group_vals)
                     res_cr[feat] = "Критерий Краскелла-Уоллиса"
                 else:
-                    p = self._mann_whitney_p(col_values(feat, picked[0]), col_values(feat, picked[1]))
+                    p = self._mann_whitney_p(group_vals[0], group_vals[1])
                     res_cr[feat] = "Критерий Манна-Уитни"
                 res_pv[feat] = self._fmt_pvalue(p, four=four)
-            # Малочисленные и исключённые из расчёта строки → «-» (а не пусто)
-            for feat in small:
-                res_pv.setdefault(feat, "-")
+            # Исключённые из расчёта строки (снятые галочки) → «-» (а не пусто)
             for feat in block.get("quant_features", []):
                 res_pv.setdefault(feat, "-")
             block.setdefault("p_results", []).append(
