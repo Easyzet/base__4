@@ -23,7 +23,7 @@ import urllib.error
 #  Достаточно менять __version__ и пушить обновлённый файл в ветку —
 #  публиковать релизы не требуется.
 # --------------------------------------------------------------------------
-__version__ = "1.0.8"                 # текущая версия приложения (увеличивайте при каждом обновлении)
+__version__ = "1.0.10"                 # текущая версия приложения (увеличивайте при каждом обновлении)
 GITHUB_OWNER = "Easyzet"             # владелец репозитория на GitHub
 GITHUB_REPO = "base__4"              # имя репозитория
 GITHUB_BRANCH = "main"               # ветка, из которой берётся обновление (обычно main или master)
@@ -759,12 +759,15 @@ class ExcelViewerApp:
         except Exception:
             return round(float(x), int(ndigits))
 
-    def _ask_decimals(self, title="Знаки после запятой", default=2, minv=0, maxv=6):
+    def _ask_decimals(self, title="Знаки после запятой", default=2, minv=0, maxv=6, parent=None):
         """Модальное окно со счётчиком (Spinbox) для выбора числа знаков после
-        запятой. Возвращает int или None, если пользователь отменил."""
-        dlg = tk.Toplevel(self.root)
+        запятой. Возвращает int или None, если пользователь отменил.
+        parent — окно, из которого вызвано (диалог привязывается к нему и
+        поднимается поверх, иначе может спрятаться за окном критериев и «зависнуть»)."""
+        owner = parent if (parent is not None and parent.winfo_exists()) else self.root
+        dlg = tk.Toplevel(owner)
         dlg.title(title)
-        dlg.transient(self.root)
+        dlg.transient(owner)
         dlg.resizable(False, False)
         result = {"value": None}
 
@@ -795,18 +798,38 @@ class ExcelViewerApp:
         tk.Button(btns, text="Отмена", width=8, command=cancel).pack(side=tk.LEFT, padx=6)
         dlg.bind("<Return>", ok)
         dlg.bind("<Escape>", cancel)
+        # Закрытие крестиком = «Отмена» (иначе wait_window может зависнуть)
+        dlg.protocol("WM_DELETE_WINDOW", cancel)
 
-        # Центрируем относительно главного окна
+        # Центрируем относительно РОДИТЕЛЬСКОГО окна (того, откуда вызвано)
         dlg.update_idletasks()
         try:
-            x = self.root.winfo_rootx() + (self.root.winfo_width() - dlg.winfo_width()) // 2
-            y = self.root.winfo_rooty() + (self.root.winfo_height() - dlg.winfo_height()) // 2
+            x = owner.winfo_rootx() + (owner.winfo_width() - dlg.winfo_width()) // 2
+            y = owner.winfo_rooty() + (owner.winfo_height() - dlg.winfo_height()) // 2
             dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
         except Exception:
             pass
+
+        # Гарантированно выводим диалог поверх окна критериев
+        try:
+            dlg.lift()
+            dlg.attributes("-topmost", True)
+            dlg.after(300, lambda: dlg.winfo_exists() and dlg.attributes("-topmost", False))
+        except Exception:
+            pass
         spin.focus_set()
-        dlg.grab_set()
-        self.root.wait_window(dlg)
+        try:
+            dlg.focus_force()
+        except Exception:
+            pass
+
+        # grab_set только когда окно уже видимо (иначе возможна ошибка/зависание)
+        try:
+            dlg.wait_visibility()
+            dlg.grab_set()
+        except Exception:
+            pass
+        owner.wait_window(dlg)
         return result["value"]
 
     def _nonnumeric_features(self, df, quant_selected):
@@ -825,11 +848,12 @@ class ExcelViewerApp:
                 bad.append(qc)
         return bad
 
-    def _warn_nonnumeric(self, df, quant_selected, what):
+    def _warn_nonnumeric(self, df, quant_selected, what, parent=None):
         """Показывает предупреждение, если среди признаков-строк есть нечисловые.
         Возвращает True, если ВСЕ выбранные признаки нечисловые (считать нечего)."""
         bad = self._nonnumeric_features(df, quant_selected)
         if bad:
+            owner = parent if (parent is not None and parent.winfo_exists()) else self.root
             messagebox.showwarning(
                 "Нечисловые признаки",
                 f"{what} можно посчитать только для числовых признаков.\n\n"
@@ -838,7 +862,8 @@ class ExcelViewerApp:
                 + "\n• ".join(bad) +
                 "\n\nВыберите числовые признаки или очистите/исправьте нечисловые "
                 "значения в этих столбцах. Для качественных признаков используйте "
-                "таблицу частот.")
+                "таблицу частот.",
+                parent=owner)
         return len(bad) == len(quant_selected) and len(bad) > 0
 
     def add_result_table(self, df, window, kind):
@@ -852,9 +877,10 @@ class ExcelViewerApp:
             return
 
         if kind == "mean":
-            if self._warn_nonnumeric(df, quant_selected, "Среднее (M ± SD)"):
+            if self._warn_nonnumeric(df, quant_selected, "Среднее (M ± SD)", parent=window):
                 return  # все признаки нечисловые — считать нечего
-            decimals = self._ask_decimals(title="Отклонения (M ± SD): округление", default=2)
+            decimals = self._ask_decimals(title="Отклонения (M ± SD): округление",
+                                          default=2, parent=window)
             if decimals is None:
                 return  # пользователь отменил
             columns, rows = self._compute_mean_rows(df, qual_selected, quant_selected, decimals)
@@ -874,7 +900,7 @@ class ExcelViewerApp:
             return
 
         if kind == "quant":
-            if self._warn_nonnumeric(df, quant_selected, "Медианы"):
+            if self._warn_nonnumeric(df, quant_selected, "Медианы", parent=window):
                 return  # все признаки нечисловые — считать нечего
             columns, rows, small_features, group_counts = self._compute_quant_rows(
                 df, qual_selected, quant_selected)
@@ -945,9 +971,16 @@ class ExcelViewerApp:
         groups = model["groups"]
         features = [f["name"] for f in model["features"]]
 
-        dlg = tk.Toplevel(self.root)
+        owner = window if (window is not None and window.winfo_exists()) else self.root
+        dlg = tk.Toplevel(owner)
         dlg.title("Расчёт p")
         dlg.geometry("560x560")
+        dlg.transient(owner)
+        try:
+            dlg.lift()
+            dlg.focus_force()
+        except Exception:
+            pass
 
         btns = tk.Frame(dlg)
         btns.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=8)
@@ -1027,13 +1060,13 @@ class ExcelViewerApp:
         def do_calc():
             chosen = [n for n, v in crit_vars.items() if v.get()]
             if not chosen:
-                messagebox.showwarning("Критерий", "Выберите критерий для расчёта p")
+                messagebox.showwarning("Критерий", "Выберите критерий для расчёта p", parent=dlg)
                 return
             criterion = chosen[0]
             chi = (criterion == "Критерий хи-квадрат")
             sel_feats = [f for f, v in feat_vars.items() if v.get()]
             if not sel_feats:
-                messagebox.showwarning("Признаки", "Выберите хотя бы один признак")
+                messagebox.showwarning("Признаки", "Выберите хотя бы один признак", parent=dlg)
                 return
             picked = []
             for cb in col_combos:
@@ -1042,12 +1075,12 @@ class ExcelViewerApp:
                     picked.append(labels.index(l))
             if chi:
                 if len(picked) < 2:
-                    messagebox.showwarning("Столбцы", "Выберите минимум два РАЗНЫХ столбца")
+                    messagebox.showwarning("Столбцы", "Выберите минимум два РАЗНЫХ столбца", parent=dlg)
                     return
             else:
                 # Фишер (2 столбца) ↔ Фишера-Фримена-Холтона (3 и более) — авто-переход
                 if len(picked) < 2:
-                    messagebox.showwarning("Столбцы", "Выберите минимум два РАЗНЫХ столбца")
+                    messagebox.showwarning("Столбцы", "Выберите минимум два РАЗНЫХ столбца", parent=dlg)
                     return
             four = four_var.get()
             res_pv, res_cr = {}, {}
@@ -1292,14 +1325,22 @@ class ExcelViewerApp:
         """Окно выбора признаков (строк) и двух столбцов для расчёта p (Манна-Уитни)."""
         features = block.get("quant_features", [])
         groups = block.get("group_defs", [])
+        owner = window if (window is not None and window.winfo_exists()) else self.root
         if len(groups) < 2:
             messagebox.showwarning("Недостаточно групп",
-                                   "Для критерия Манна-Уитни нужно минимум два столбца (группы).")
+                                   "Для критерия Манна-Уитни нужно минимум два столбца (группы).",
+                                   parent=owner)
             return
 
-        dlg = tk.Toplevel(self.root)
+        dlg = tk.Toplevel(owner)
         dlg.title("Расчёт p")
         dlg.geometry("560x560")
+        dlg.transient(owner)
+        try:
+            dlg.lift()
+            dlg.focus_force()
+        except Exception:
+            pass
 
         # Кнопки закреплены снизу, остальное — в прокручиваемой области
         btns = tk.Frame(dlg)
@@ -1411,23 +1452,24 @@ class ExcelViewerApp:
         def do_calc():
             chosen = [n for n, v in crit_vars.items() if v.get()]
             if not chosen:
-                messagebox.showwarning("Критерий", "Выберите критерий для расчёта p")
+                messagebox.showwarning("Критерий", "Выберите критерий для расчёта p", parent=dlg)
                 return
             criterion = chosen[0]
             kw = (criterion == "Критерий Краскелла-Уоллиса")
             sel_feats = [f for f, v in feat_vars.items() if v.get()]
             if not sel_feats:
-                messagebox.showwarning("Признаки", "Выберите хотя бы один признак-строку")
+                messagebox.showwarning("Признаки", "Выберите хотя бы один признак-строку", parent=dlg)
                 return
             picked = _distinct_picked()
             if kw:
                 if len(picked) < 2:
-                    messagebox.showwarning("Столбцы", "Выберите минимум два РАЗНЫХ столбца")
+                    messagebox.showwarning("Столбцы", "Выберите минимум два РАЗНЫХ столбца", parent=dlg)
                     return
             else:
                 if len(picked) != 2:
                     messagebox.showwarning("Столбцы",
-                                           "Для критерия Манна-Уитни нужно ровно два РАЗНЫХ столбца")
+                                           "Для критерия Манна-Уитни нужно ровно два РАЗНЫХ столбца",
+                                           parent=dlg)
                     return
             pv = self._pretty_value
             four = four_var.get()
