@@ -23,7 +23,7 @@ import urllib.error
 #  Достаточно менять __version__ и пушить обновлённый файл в ветку —
 #  публиковать релизы не требуется.
 # --------------------------------------------------------------------------
-__version__ = "1.0.11"                 # текущая версия приложения (увеличивайте при каждом обновлении)
+__version__ = "1.0.12"                 # текущая версия приложения (увеличивайте при каждом обновлении)
 GITHUB_OWNER = "Easyzet"             # владелец репозитория на GitHub
 GITHUB_REPO = "base__4"              # имя репозитория
 GITHUB_BRANCH = "main"               # ветка, из которой берётся обновление (обычно main или master)
@@ -1145,6 +1145,18 @@ class ExcelViewerApp:
         if not specs:
             dashes = {f: "-" for f in block.get("small_features", set())}
             specs = [{"header": "p", "pvalues": dashes, "p_criteria": {}}]
+        # Если столбцов p несколько и заголовки совпадают («p» и «p») — нумеруем,
+        # чтобы столбцы были различимы.
+        if len(specs) > 1:
+            counts = {}
+            for sp in specs:
+                counts[sp["header"]] = counts.get(sp["header"], 0) + 1
+            seen = {}
+            for sp in specs:
+                h = sp["header"]
+                if counts[h] > 1:
+                    seen[h] = seen.get(h, 0) + 1
+                    sp["header"] = f"{h} ({seen[h]})"
         return specs
 
     def _p_criteria_index(self, specs, always=False):
@@ -1162,25 +1174,26 @@ class ExcelViewerApp:
         return {}, used
 
     def _block_as_features(self, block):
-        """Преобразует блок в список признаков для объединённой таблицы + p/критерии
-        (берётся первый набор расчётов p)."""
+        """Преобразует блок в список признаков + СПИСОК наборов p — по одному на
+        каждый столбец p блока (а не только первый). Для no_p-блоков (M ± SD)
+        p не подставляется (столбцов нет)."""
         feats = []
-        pvalues = {}
-        p_criteria = {}
-        # Таблица отклонений (M ± SD) помечена no_p — для неё p не считается и не
-        # должно подставляться при объединении, даже если признак с таким же именем
-        # есть в другой таблице (иначе p дублировалось бы напротив отклонений).
         no_p = bool(block.get("no_p"))
-        results = block.get("p_results", [])
-        if results and not no_p:
-            pv = results[0].get("pvalues", {})
-            pc = results[0].get("p_criteria", {})
-        elif no_p:
-            pv = {}
-            pc = {}
-        else:
-            pv = {f: "-" for f in block.get("small_features", set())}
-            pc = {}
+        results = [] if no_p else block.get("p_results", [])
+
+        # Наборы p по столбцам этого блока
+        col_results = []
+        if results:
+            for res in results:
+                col_results.append({"pvalues": dict(res.get("pvalues", {})),
+                                    "p_criteria": dict(res.get("p_criteria", {})),
+                                    "compared": res.get("compared")})
+        elif not no_p:
+            # Расчётов не было — один столбец с прочерками для малочисленных строк
+            col_results.append({"pvalues": {f: "-" for f in block.get("small_features", set())},
+                                "p_criteria": {}, "compared": None})
+        # для no_p столбцов p нет вообще
+
         if block["kind"] == "quant":
             n_groups = len(block.get("group_defs", []))
             for r in block["rows"]:
@@ -1192,23 +1205,13 @@ class ExcelViewerApp:
                     cells.append({"N": n_val, "np": val})
                 feats.append({"name": name, "binary": True, "no_p": no_p,
                               "rows": [{"category": "", "cells": cells}]})
-                if not no_p:
-                    if name in pv:
-                        pvalues[name] = pv[name]
-                    if name in pc:
-                        p_criteria[name] = pc[name]
         else:
             for f in block["model"]["features"]:
                 if no_p:
                     f = dict(f)
                     f["no_p"] = True
                 feats.append(f)
-                if not no_p:
-                    if f["name"] in pv:
-                        pvalues[f["name"]] = pv[f["name"]]
-                    if f["name"] in pc:
-                        p_criteria[f["name"]] = pc[f["name"]]
-        return feats, pvalues, p_criteria
+        return feats, col_results
 
     def _refresh_merge_labels(self, window):
         """Обновляет подписи галочек объединения, показывая № порядка выделения."""
@@ -1254,13 +1257,30 @@ class ExcelViewerApp:
                 return
 
         features = []
-        pvalues = {}
-        p_criteria = {}
+        per_block = []      # список col_results каждой таблицы
+        max_p = 0
         for b in selected:
-            f, pv, pc = self._block_as_features(b)
+            f, col_results = self._block_as_features(b)
             features += f
-            pvalues.update(pv)
-            p_criteria.update(pc)
+            per_block.append(col_results)
+            max_p = max(max_p, len(col_results))
+        if max_p == 0:
+            max_p = 1       # хотя бы один (пустой) столбец p
+
+        # Объединяем столбцы p по индексам: столбец i собирается из i-х столбцов
+        # каждой таблицы; у таблиц, где столбца i нет, признаки остаются пустыми.
+        merged_results = []
+        for i in range(max_p):
+            col_pv, col_pc = {}, {}
+            compared = None
+            for col_results in per_block:
+                if i < len(col_results):
+                    col_pv.update(col_results[i]["pvalues"])
+                    col_pc.update(col_results[i]["p_criteria"])
+                    if compared is None and col_results[i].get("compared"):
+                        compared = col_results[i]["compared"]
+            merged_results.append({"pvalues": col_pv, "p_criteria": col_pc,
+                                   "compared": compared})
 
         model = {"groups": base_defs, "features": features}
         title = "Объединённая таблица  |  группы: " + ", ".join(
@@ -1268,8 +1288,7 @@ class ExcelViewerApp:
         merged = {"kind": "count", "merged": True, "kind_label": "Объединённая таблица",
                   "title": title, "model": model, "ci": None,
                   "value_header": "Me [Q1; Q3]/n(%)",
-                  "p_results": [{"pvalues": pvalues, "p_criteria": p_criteria,
-                                 "compared": None}]}
+                  "p_results": merged_results}
         # снять отметки с исходных таблиц
         for b in selected:
             b["_selected"] = False
