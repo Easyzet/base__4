@@ -23,21 +23,33 @@ import urllib.error
 #  Достаточно менять __version__ и пушить обновлённый файл в ветку —
 #  публиковать релизы не требуется.
 # --------------------------------------------------------------------------
-__version__ = "1.0.12"                 # текущая версия приложения (увеличивайте при каждом обновлении)
+__version__ = "1.0.13"                 # текущая версия приложения (увеличивайте при каждом обновлении)
 GITHUB_OWNER = "Easyzet"             # владелец репозитория на GitHub
 GITHUB_REPO = "base__4"              # имя репозитория
 GITHUB_BRANCH = "main"               # ветка, из которой берётся обновление (обычно main или master)
 # Путь к файлу внутри репозитория. Если файл лежит в корне — оставьте имя файла.
 # Если в подпапке — укажите, например, "src/base.py".
 REMOTE_SCRIPT_PATH = os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else "base.py"
-UPDATE_TIMEOUT = 6                    # таймаут сетевых запросов, сек
+UPDATE_TIMEOUT = 15                   # таймаут сетевых запросов, сек
+UPDATE_RETRIES = 2                    # доп. повторные попытки на каждый источник
 # ==========================================================================
 
 
+def _update_sources():
+    """Список URL-источников обновления в порядке приоритета.
+    Сначала GitHub (raw), при недоступности — зеркало jsDelivr (другой CDN,
+    часто доступно там, где raw.githubusercontent.com тормозит/блокируется)."""
+    return [
+        (f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/"
+         f"{GITHUB_BRANCH}/{REMOTE_SCRIPT_PATH}"),
+        (f"https://cdn.jsdelivr.net/gh/{GITHUB_OWNER}/{GITHUB_REPO}@{GITHUB_BRANCH}/"
+         f"{REMOTE_SCRIPT_PATH}"),
+    ]
+
+
 def _raw_github_url():
-    """URL raw-версии файла в репозитории для указанной ветки."""
-    return (f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/"
-            f"{GITHUB_BRANCH}/{REMOTE_SCRIPT_PATH}")
+    """URL raw-версии файла в репозитории (основной источник)."""
+    return _update_sources()[0]
 
 
 def _parse_version(v):
@@ -3926,13 +3938,8 @@ class ExcelViewerApp:
             messagebox.showerror("Ошибка", f"Не удалось сохранить файл: {str(e)}")
     
     # ================== Автообновление с GitHub ==================
-    def _fetch_remote_info(self):
-        """Скачивает raw-файл из репозитория, читает его __version__ и размер.
-        Возвращает dict {version, size, content(bytes)} либо бросает исключение
-        (нет интернета, репозиторий не настроен и т.п.)."""
-        if GITHUB_OWNER.startswith("ВАШ_") or GITHUB_REPO.startswith("ВАШ_"):
-            raise RuntimeError("Не заданы GITHUB_OWNER / GITHUB_REPO")
-        url = _raw_github_url()
+    def _fetch_one_source(self, url):
+        """Скачивает файл по одному URL, читает его __version__ и размер."""
         req = urllib.request.Request(url, headers={"User-Agent": "ExcelViewerApp-Updater"})
         with urllib.request.urlopen(req, timeout=UPDATE_TIMEOUT) as resp:
             content = resp.read()
@@ -3941,6 +3948,27 @@ class ExcelViewerApp:
         if not m:
             raise RuntimeError("В удалённом файле не найдена строка __version__")
         return {"version": m.group(1), "size": len(content), "content": content}
+
+    def _fetch_remote_info(self):
+        """Скачивает файл из репозитория (несколько источников с повторами),
+        читает его __version__ и размер. Возвращает dict {version, size, content}
+        либо бросает исключение (нет интернета, репозиторий не настроен и т.п.).
+
+        Сначала пробуется GitHub (raw), при неудаче — зеркало jsDelivr. На каждый
+        источник делается несколько попыток (UPDATE_RETRIES), чтобы пережить
+        случайные тайм-ауты TLS-рукопожатия."""
+        if GITHUB_OWNER.startswith("ВАШ_") or GITHUB_REPO.startswith("ВАШ_"):
+            raise RuntimeError("Не заданы GITHUB_OWNER / GITHUB_REPO")
+        last_err = None
+        for url in _update_sources():
+            for attempt in range(1 + max(0, UPDATE_RETRIES)):
+                try:
+                    return self._fetch_one_source(url)
+                except Exception as e:
+                    last_err = e
+                    continue
+        # все источники и попытки не удались
+        raise last_err if last_err is not None else RuntimeError("Источники обновления недоступны")
 
     def check_updates_on_startup(self):
         """Тихая фоновая проверка при запуске: если версия новее — предложить
