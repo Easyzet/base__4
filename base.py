@@ -23,7 +23,7 @@ import urllib.error
 #  Достаточно менять __version__ и пушить обновлённый файл в ветку —
 #  публиковать релизы не требуется.
 # --------------------------------------------------------------------------
-__version__ = "1.0.13"                 # текущая версия приложения (увеличивайте при каждом обновлении)
+__version__ = "1.1.0"                 # текущая версия приложения (увеличивайте при каждом обновлении)
 GITHUB_OWNER = "Easyzet"             # владелец репозитория на GitHub
 GITHUB_REPO = "base__4"              # имя репозитория
 GITHUB_BRANCH = "main"               # ветка, из которой берётся обновление (обычно main или master)
@@ -611,6 +611,9 @@ class ExcelViewerApp:
         tk.Button(button_frame, text="+ Таблица M±SD",
                   command=lambda: self.add_result_table(df, criteria_window, "mean"),
                   bg="#00695c", fg="white").pack(side=tk.LEFT, padx=4)
+        tk.Button(button_frame, text="+ Верхнеуровневая таблица",
+                  command=lambda: self.add_top_result_table(df, criteria_window),
+                  bg="#ef6c00", fg="white").pack(side=tk.LEFT, padx=4)
         tk.Button(button_frame, text="Объединить выбранные",
                   command=lambda: self.merge_selected(criteria_window),
                   bg="#6a1b9a", fg="white").pack(side=tk.LEFT, padx=4)
@@ -966,6 +969,258 @@ class ExcelViewerApp:
         if kind == "count":
             self._ask_and_fill_count_pvalues(df, window, block)
 
+    # ============ Верхнеуровневые (двухуровневые) таблицы ============
+    def _fixed_group_values(self, df, qual_selected, pretty=False):
+        """Состав значений группирующих признаков, посчитанный по ПОЛНОЙ выборке.
+        Нужен, чтобы во всех верхнеуровневых группах были одинаковые столбцы."""
+        out = {}
+        for col in qual_selected:
+            uv = df[col].dropna().astype(str).unique()
+            if pretty:
+                out[col] = sorted({self._pretty_value(v) for v in uv if str(v).strip() != ''})
+            else:
+                out[col] = sorted([v for v in uv if str(v).strip() != ''])
+        return out
+
+    def _top_defs_for(self, df, top_col, include_total=True):
+        """Определения верхнеуровневых групп (плюс, при желании, «Вся когорта»)."""
+        pv = self._pretty_value
+        defs = []
+        vals = sorted({pv(v) for v in df[top_col].dropna().astype(str).unique()
+                       if str(v).strip() != ''})
+        for v in vals:
+            n = int((df[top_col].astype(str).map(pv) == v).sum())
+            defs.append({"col": top_col, "value": v, "label": f"{top_col} = {v}",
+                         "n": n, "total": False})
+        if include_total:
+            defs.append({"col": None, "value": None, "label": "Вся когорта",
+                         "n": int(len(df)), "total": True})
+        return defs
+
+    def _top_subset(self, df, top_def):
+        """Подвыборка данных для одной верхнеуровневой группы."""
+        if top_def.get("total"):
+            return df
+        return df[df[top_def["col"]].astype(str).map(self._pretty_value) == top_def["value"]]
+
+    def _ask_top_settings(self, df, window):
+        """Диалог: верхнеуровневый признак, тип расчёта, столбец «Вся когорта»."""
+        owner = window if (window is not None and window.winfo_exists()) else self.root
+        dlg = tk.Toplevel(owner)
+        dlg.title("Верхнеуровневый признак")
+        dlg.transient(owner)
+        dlg.resizable(False, False)
+        result = {"value": None}
+
+        tk.Label(dlg, text="Верхнеуровневый признак (делит выборку на основные столбцы):",
+                 font=("Arial", 10, "bold")).pack(anchor="w", padx=12, pady=(12, 2))
+        cb = ttk.Combobox(dlg, state="readonly", width=44, values=list(df.columns))
+        cb.pack(anchor="w", padx=12)
+        if len(df.columns):
+            cb.current(0)
+
+        info = tk.Label(dlg, text="", fg="#0d47a1", anchor="w", justify="left")
+        info.pack(anchor="w", padx=12, pady=(4, 0))
+
+        def _upd_info(*_):
+            col = cb.get()
+            if not col or col not in df.columns:
+                info.config(text="")
+                return
+            vals = sorted({self._pretty_value(v) for v in df[col].dropna().astype(str).unique()
+                           if str(v).strip() != ''})
+            shown = ", ".join(vals[:6]) + ("…" if len(vals) > 6 else "")
+            info.config(text=f"Групп: {len(vals)}  ({shown})")
+
+        cb.bind("<<ComboboxSelected>>", _upd_info)
+        _upd_info()
+
+        kind_frame = tk.LabelFrame(dlg, text="Что считать внутри каждой группы",
+                                   font=("Arial", 10, "bold"))
+        kind_frame.pack(fill=tk.X, padx=12, pady=(10, 4))
+        kind_var = tk.StringVar(value="quant")
+        for val, txt in [("quant", "Медианы  Me [Q1; Q3]"),
+                         ("count", "Частоты  n (%)"),
+                         ("mean", "Среднее  M ± SD")]:
+            tk.Radiobutton(kind_frame, text=txt, variable=kind_var, value=val,
+                           anchor="w").pack(fill=tk.X, padx=6)
+
+        total_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(dlg, text="Добавить столбец «Вся когорта» (по всей выборке)",
+                       variable=total_var, anchor="w").pack(fill=tk.X, padx=12, pady=(2, 0))
+
+        tk.Label(dlg, text="Строки и столбцы берутся из выбранных признаков в главном окне.",
+                 fg="#555555", anchor="w", wraplength=430,
+                 justify="left").pack(fill=tk.X, padx=12, pady=(6, 0))
+
+        btns = tk.Frame(dlg)
+        btns.pack(fill=tk.X, padx=12, pady=12)
+
+        def ok(_=None):
+            col = cb.get()
+            if not col or col not in df.columns:
+                messagebox.showwarning("Признак", "Выберите верхнеуровневый признак", parent=dlg)
+                return
+            result["value"] = {"top_col": col, "kind": kind_var.get(),
+                               "total": bool(total_var.get())}
+            dlg.destroy()
+
+        def cancel(_=None):
+            result["value"] = None
+            dlg.destroy()
+
+        tk.Button(btns, text="Построить", width=12, command=ok,
+                  bg="green", fg="white").pack(side=tk.LEFT, padx=4)
+        tk.Button(btns, text="Отмена", width=10, command=cancel).pack(side=tk.LEFT, padx=4)
+        dlg.bind("<Return>", ok)
+        dlg.bind("<Escape>", cancel)
+        dlg.protocol("WM_DELETE_WINDOW", cancel)
+
+        dlg.update_idletasks()
+        try:
+            x = owner.winfo_rootx() + (owner.winfo_width() - dlg.winfo_width()) // 2
+            y = owner.winfo_rooty() + (owner.winfo_height() - dlg.winfo_height()) // 2
+            dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            pass
+        try:
+            dlg.lift()
+            dlg.attributes("-topmost", True)
+            dlg.after(300, lambda: dlg.winfo_exists() and dlg.attributes("-topmost", False))
+            dlg.focus_force()
+        except Exception:
+            pass
+        try:
+            dlg.wait_visibility()
+            dlg.grab_set()
+        except Exception:
+            pass
+        owner.wait_window(dlg)
+        return result["value"]
+
+    def add_top_result_table(self, df, window):
+        """Строит таблицу с верхнеуровневым признаком: выборка делится на основные
+        столбцы, и внутри каждого идёт обычный расчёт по выбранным строкам/столбцам."""
+        qual_selected = self._selected_columns(window.qual_table)
+        quant_selected = self._ordered_quant_columns(window)
+        if not qual_selected or not quant_selected:
+            messagebox.showwarning("Предупреждение",
+                                   "Выберите хотя бы один качественный признак (группа-столбец) "
+                                   "и хотя бы один признак-строку",
+                                   parent=window)
+            return
+
+        st = self._ask_top_settings(df, window)
+        if st is None:
+            return
+        top_col, sub_kind, include_total = st["top_col"], st["kind"], st["total"]
+
+        if top_col in qual_selected or top_col in quant_selected:
+            messagebox.showwarning(
+                "Верхнеуровневый признак",
+                f"Признак «{top_col}» уже выбран как столбец или строка.\n\n"
+                "Верхнеуровневый признак должен отличаться от признаков, "
+                "выбранных для строк и столбцов.",
+                parent=window)
+            return
+
+        label_map = {"quant": "Медианы", "count": "Частоты", "mean": "Среднее (M ± SD)"}
+        if sub_kind in ("quant", "mean"):
+            if self._warn_nonnumeric(df, quant_selected, label_map[sub_kind], parent=window):
+                return
+        decimals = None
+        if sub_kind == "mean":
+            decimals = self._ask_decimals(title="Отклонения (M ± SD): округление",
+                                          default=2, parent=window)
+            if decimals is None:
+                return
+
+        top_defs = self._top_defs_for(df, top_col, include_total)
+        real_tops = [t for t in top_defs if not t.get("total")]
+        if len(real_tops) < 2:
+            messagebox.showwarning(
+                "Верхнеуровневый признак",
+                f"У признака «{top_col}» меньше двух значений — "
+                "делить выборку не на что.",
+                parent=window)
+            return
+
+        # Состав столбцов фиксируется по полной выборке, чтобы во всех
+        # верхнеуровневых группах были одинаковые столбцы.
+        raw_vals = self._fixed_group_values(df, qual_selected, pretty=False)
+        pv_vals = self._fixed_group_values(df, qual_selected, pretty=True)
+        use_vals = pv_vals if sub_kind == "count" else raw_vals
+        group_defs = []
+        for col in qual_selected:
+            for v in use_vals[col]:
+                group_defs.append({"col": col, "value": v, "label": f"{col} = {v}"})
+
+        fixed_cats = None
+        if sub_kind == "count":
+            pv = self._pretty_value
+            fixed_cats = {}
+            for feat in quant_selected:
+                fixed_cats[feat] = sorted({pv(v) for v in df[feat].dropna().astype(str).unique()
+                                           if str(v).strip() != ''})
+
+        pct_manual = bool(window.pct_manual.get())
+        try:
+            pct_decimals = int(window.pct_spin.get())
+        except Exception:
+            pct_decimals = 0
+
+        subs = []
+        for td in top_defs:
+            sdf = self._top_subset(df, td)
+            if sub_kind == "count":
+                model = self._compute_count_structure(sdf, qual_selected, quant_selected, None,
+                                                      pct_manual, pct_decimals,
+                                                      fixed_values=pv_vals, fixed_cats=fixed_cats)
+                subs.append({"top": td, "model": model, "p_results": []})
+            elif sub_kind == "mean":
+                cols, rows = self._compute_mean_rows(sdf, qual_selected, quant_selected,
+                                                     decimals, fixed_values=raw_vals)
+                subs.append({"top": td, "columns": cols, "rows": rows,
+                             "small_features": set(), "group_counts": {}, "p_results": []})
+            else:
+                cols, rows, small, gc = self._compute_quant_rows(sdf, qual_selected, quant_selected,
+                                                                 fixed_values=raw_vals)
+                subs.append({"top": td, "columns": cols, "rows": rows,
+                             "small_features": set(small), "group_counts": gc,
+                             "p_results": []})
+
+        vh = {"quant": "Me [Q1; Q3]", "count": "n (%)", "mean": "M ± SD"}[sub_kind]
+        block = {"kind": "top", "sub_kind": sub_kind,
+                 "kind_label": f"Верхнеуровневая таблица — {label_map[sub_kind]} (по «{top_col}»)",
+                 "title": (f"{label_map[sub_kind]} по «{top_col}»  |  столбцы: "
+                           + ", ".join(qual_selected)),
+                 "top_col": top_col, "top_defs": top_defs, "subs": subs,
+                 "group_defs": group_defs, "quant_features": list(quant_selected),
+                 "qual_selected": list(qual_selected), "value_header": vh,
+                 "no_p": (sub_kind == "mean"), "decimals": decimals, "p_results": []}
+        window.result_blocks.append(block)
+        self._render_block(window, block)
+        if sub_kind != "mean":
+            self._ask_and_fill_top_pvalues(df, window, block)
+
+    def _ask_and_fill_top_pvalues(self, df, window, block):
+        """Предлагает заполнить столбцы p — расчёт идёт в каждой верхнеуровневой группе."""
+        if self._block_n_groups(block) < 2:
+            return
+        owner = window if (window is not None and window.winfo_exists()) else self.root
+        crit = ("критерию Манна-Уитни" if block["sub_kind"] == "quant"
+                else "точному критерию Фишера")
+        if not messagebox.askyesno(
+                "Столбцы p",
+                f"Заполнить столбцы p по {crit}?\n\n"
+                "Расчёт будет выполнен отдельно внутри каждой верхнеуровневой группы.",
+                parent=owner):
+            return
+        if block["sub_kind"] == "quant":
+            self._open_pvalue_dialog(df, window, block)
+        else:
+            self._open_count_pvalue_dialog(window, block)
+
     def _ask_and_fill_count_pvalues(self, df, window, block):
         """Спрашивает, заполнять ли столбец p (точный критерий Фишера), и открывает окно."""
         groups = block["model"]["groups"]
@@ -981,7 +1236,11 @@ class ExcelViewerApp:
 
     def _open_count_pvalue_dialog(self, window, block):
         """Окно расчёта p для таблицы частот (точный критерий Фишера / Фишера-Фримена-Холтона)."""
-        model = block["model"]
+        if block["kind"] == "top":
+            # Структура одинакова во всех верхнеуровневых группах — берём первую
+            model = block["subs"][0]["model"]
+        else:
+            model = block["model"]
         groups = model["groups"]
         features = [f["name"] for f in model["features"]]
 
@@ -1097,28 +1356,41 @@ class ExcelViewerApp:
                     messagebox.showwarning("Столбцы", "Выберите минимум два РАЗНЫХ столбца", parent=dlg)
                     return
             four = four_var.get()
-            res_pv, res_cr = {}, {}
-            for f in model["features"]:
-                if f["name"] not in sel_feats:
-                    continue
-                table = [[row["cells"][gi]["cnt"] for gi in picked] for row in f["rows"]]
-                if chi:
-                    res_pv[f["name"]] = self._fmt_pvalue(self._chi2_test(table), four=four)
-                    res_cr[f["name"]] = "Критерий хи-квадрат"
-                elif len(picked) == 2:
-                    res_pv[f["name"]] = self._fmt_pvalue(self._fisher_exact_2col(table), four=four)
-                    res_cr[f["name"]] = ("Точный двусторонний критерий Фишера" if len(table) == 2
-                                         else "Критерий Фишера-Фримена-Холтона")
-                else:
-                    # 3 и более столбцов — критерий Фишера-Фримена-Холтона (Монте-Карло)
-                    res_pv[f["name"]] = self._fmt_pvalue(self._fisher_freeman_halton_p(table), four=four)
-                    res_cr[f["name"]] = "Критерий Фишера-Фримена-Холтона"
-            # Строки, исключённые из расчёта, помечаем «-» (а не пусто)
-            for f in model["features"]:
-                res_pv.setdefault(f["name"], "-")
-            block.setdefault("p_results", []).append(
-                {"pvalues": res_pv, "p_criteria": res_cr,
-                 "compared": tuple(groups[gi]["value"] for gi in picked)})
+
+            def compute_for(mdl):
+                """Считает p по одной модели (вся выборка или одна верхнеуровневая группа)."""
+                res_pv, res_cr = {}, {}
+                for f in mdl["features"]:
+                    if f["name"] not in sel_feats:
+                        continue
+                    table = [[row["cells"][gi]["cnt"] for gi in picked] for row in f["rows"]]
+                    if chi:
+                        res_pv[f["name"]] = self._fmt_pvalue(self._chi2_test(table), four=four)
+                        res_cr[f["name"]] = "Критерий хи-квадрат"
+                    elif len(picked) == 2:
+                        res_pv[f["name"]] = self._fmt_pvalue(self._fisher_exact_2col(table), four=four)
+                        res_cr[f["name"]] = ("Точный двусторонний критерий Фишера" if len(table) == 2
+                                             else "Критерий Фишера-Фримена-Холтона")
+                    else:
+                        # 3 и более столбцов — критерий Фишера-Фримена-Холтона (Монте-Карло)
+                        res_pv[f["name"]] = self._fmt_pvalue(self._fisher_freeman_halton_p(table),
+                                                             four=four)
+                        res_cr[f["name"]] = "Критерий Фишера-Фримена-Холтона"
+                # Строки, исключённые из расчёта, помечаем «-» (а не пусто)
+                for f in mdl["features"]:
+                    res_pv.setdefault(f["name"], "-")
+                return res_pv, res_cr
+
+            compared = tuple(groups[gi]["value"] for gi in picked)
+            if block["kind"] == "top":
+                for sub in block["subs"]:
+                    r_pv, r_cr = compute_for(sub["model"])
+                    sub.setdefault("p_results", []).append(
+                        {"pvalues": r_pv, "p_criteria": r_cr, "compared": compared})
+            else:
+                res_pv, res_cr = compute_for(model)
+                block.setdefault("p_results", []).append(
+                    {"pvalues": res_pv, "p_criteria": res_cr, "compared": compared})
             block["always_label_criterion"] = bool(always_var.get())
             self._rerender_all(window)
             dlg.destroy()
@@ -1129,6 +1401,8 @@ class ExcelViewerApp:
 
     def _block_group_defs(self, block):
         """Возвращает определения групп-столбцов блока (список {col,value,label})."""
+        if block["kind"] == "top":
+            return list(block.get("group_defs", []))
         if block["kind"] == "quant":
             return list(block.get("group_defs", []))
         return list(block["model"]["groups"])
@@ -1136,14 +1410,9 @@ class ExcelViewerApp:
     def _block_n_groups(self, block):
         return len(self._block_group_defs(block))
 
-    def _p_column_specs(self, block):
-        """Список столбцов p для отрисовки/экспорта:
-        [{'header':..., 'pvalues':{feat:str}, 'p_criteria':{feat:crit}}].
-        Если расчётов ещё не было — один пустой столбец 'p'
-        (с прочерками для строк N<=4)."""
-        results = block.get("p_results", [])
+    def _p_specs_from(self, results, n_groups, small_features=()):
+        """Общий построитель списка столбцов p из набора расчётов."""
         specs = []
-        n_groups = self._block_n_groups(block)
         for res in results:
             comp = res.get("compared")
             if comp and n_groups > 2:
@@ -1155,7 +1424,7 @@ class ExcelViewerApp:
                           "pvalues": res.get("pvalues", {}),
                           "p_criteria": res.get("p_criteria", {})})
         if not specs:
-            dashes = {f: "-" for f in block.get("small_features", set())}
+            dashes = {f: "-" for f in (small_features or set())}
             specs = [{"header": "p", "pvalues": dashes, "p_criteria": {}}]
         # Если столбцов p несколько и заголовки совпадают («p» и «p») — нумеруем,
         # чтобы столбцы были различимы.
@@ -1170,6 +1439,32 @@ class ExcelViewerApp:
                     seen[h] = seen.get(h, 0) + 1
                     sp["header"] = f"{h} ({seen[h]})"
         return specs
+
+    def _p_column_specs(self, block):
+        """Список столбцов p для отрисовки/экспорта:
+        [{'header':..., 'pvalues':{feat:str}, 'p_criteria':{feat:crit}}].
+        Если расчётов ещё не было — один пустой столбец 'p'
+        (с прочерками для строк N<=4)."""
+        return self._p_specs_from(block.get("p_results", []),
+                                  self._block_n_groups(block),
+                                  block.get("small_features", set()))
+
+    def _top_p_specs(self, block):
+        """Для верхнеуровневого блока: список списков столбцов p — по одному
+        набору на каждую верхнеуровневую группу. Число столбцов выравнивается
+        по максимуму, недостающие дополняются пустыми."""
+        n_groups = self._block_n_groups(block)
+        per_top = []
+        for sub in block["subs"]:
+            per_top.append(self._p_specs_from(sub.get("p_results", []), n_groups,
+                                              sub.get("small_features", set())))
+        if block.get("no_p"):
+            return [[] for _ in per_top]
+        n_max = max((len(s) for s in per_top), default=1)
+        for specs in per_top:
+            while len(specs) < n_max:
+                specs.append({"header": "p", "pvalues": {}, "p_criteria": {}})
+        return per_top
 
     def _p_criteria_index(self, specs, always=False):
         """Карта критерий->номер и упорядоченный список критериев.
@@ -1257,6 +1552,12 @@ class ExcelViewerApp:
         if len(selected) < 2:
             messagebox.showwarning("Объединение",
                                    "Отметьте минимум две таблицы галочкой «Выбрать для объединения»")
+            return
+        if any(b["kind"] == "top" for b in selected):
+            messagebox.showwarning(
+                "Объединение невозможно",
+                "Верхнеуровневые таблицы нельзя объединять с обычными: "
+                "у них другая структура столбцов.")
             return
         base_defs = self._block_group_defs(selected[0])
         base_labels = [g["label"] for g in base_defs]
@@ -1508,34 +1809,50 @@ class ExcelViewerApp:
                     return
             pv = self._pretty_value
             four = four_var.get()
-            res_pv, res_cr = {}, {}
-
-            def col_values(feat, gd):
-                return df[(df[gd["col"]].astype(str).map(pv) == gd["value"]) &
-                          df[feat].notna() &
-                          (df[feat].astype(str).str.strip() != '')][feat].astype(float).tolist()
 
             SMALL_N = 4  # порог малочисленности (как в таблице: N<=4 — значения через «;»)
-            for feat in sel_feats:
-                group_vals = [col_values(feat, gd) for gd in picked]
-                # Признак исключается из расчёта («-»), только если малочисленна
-                # одна из СРАВНИВАЕМЫХ групп, а не любая группа таблицы.
-                if any(len(gv) <= SMALL_N for gv in group_vals):
-                    res_pv[feat] = "-"
-                    continue
-                if kw:
-                    p = self._kruskal_wallis_p(group_vals)
-                    res_cr[feat] = "Критерий Краскелла-Уоллиса"
-                else:
-                    p = self._mann_whitney_p(group_vals[0], group_vals[1])
-                    res_cr[feat] = "Критерий Манна-Уитни"
-                res_pv[feat] = self._fmt_pvalue(p, four=four)
-            # Исключённые из расчёта строки (снятые галочки) → «-» (а не пусто)
-            for feat in block.get("quant_features", []):
-                res_pv.setdefault(feat, "-")
-            block.setdefault("p_results", []).append(
-                {"pvalues": res_pv, "p_criteria": res_cr,
-                 "compared": tuple(gd["value"] for gd in picked)})
+
+            def compute_for(sdf):
+                """Считает p по одному набору данных (вся выборка или одна
+                верхнеуровневая группа)."""
+                res_pv, res_cr = {}, {}
+
+                def col_values(feat, gd):
+                    return sdf[(sdf[gd["col"]].astype(str).map(pv) == gd["value"]) &
+                               sdf[feat].notna() &
+                               (sdf[feat].astype(str).str.strip() != '')][feat].astype(float).tolist()
+
+                for feat in sel_feats:
+                    group_vals = [col_values(feat, gd) for gd in picked]
+                    # Признак исключается из расчёта («-»), только если малочисленна
+                    # одна из СРАВНИВАЕМЫХ групп, а не любая группа таблицы.
+                    if any(len(gv) <= SMALL_N for gv in group_vals):
+                        res_pv[feat] = "-"
+                        continue
+                    if kw:
+                        p = self._kruskal_wallis_p(group_vals)
+                        res_cr[feat] = "Критерий Краскелла-Уоллиса"
+                    else:
+                        p = self._mann_whitney_p(group_vals[0], group_vals[1])
+                        res_cr[feat] = "Критерий Манна-Уитни"
+                    res_pv[feat] = self._fmt_pvalue(p, four=four)
+                # Исключённые из расчёта строки (снятые галочки) → «-» (а не пусто)
+                for feat in block.get("quant_features", []):
+                    res_pv.setdefault(feat, "-")
+                return res_pv, res_cr
+
+            compared = tuple(gd["value"] for gd in picked)
+            if block["kind"] == "top":
+                # Один и тот же расчёт выполняется в каждой верхнеуровневой группе
+                for sub in block["subs"]:
+                    sdf = self._top_subset(df, sub["top"])
+                    r_pv, r_cr = compute_for(sdf)
+                    sub.setdefault("p_results", []).append(
+                        {"pvalues": r_pv, "p_criteria": r_cr, "compared": compared})
+            else:
+                res_pv, res_cr = compute_for(df)
+                block.setdefault("p_results", []).append(
+                    {"pvalues": res_pv, "p_criteria": res_cr, "compared": compared})
             block["always_label_criterion"] = bool(always_var.get())
             self._rerender_all(window)
             dlg.destroy()
@@ -1544,11 +1861,17 @@ class ExcelViewerApp:
                   bg="green", fg="white").pack(side=tk.LEFT, padx=4)
         tk.Button(btns, text="Отмена", command=dlg.destroy).pack(side=tk.RIGHT, padx=4)
 
-    def _compute_quant_rows(self, df, qual_selected, quant_selected):
+    def _compute_quant_rows(self, df, qual_selected, quant_selected, fixed_values=None):
         """Возвращает (columns, rows, small_features, group_counts) для таблицы медиан.
-        Если N<=4 — вместо медианы перечисляем значения через '; '."""
+        Если N<=4 — вместо медианы перечисляем значения через '; '.
+        fixed_values — заранее заданный состав значений каждого группирующего
+        признака (нужно для верхнеуровневых таблиц, чтобы столбцы совпадали
+        во всех верхнеуровневых группах, даже если в подвыборке значения нет)."""
         qual_unique_values = {}
         for col in qual_selected:
+            if fixed_values and col in fixed_values:
+                qual_unique_values[col] = list(fixed_values[col])
+                continue
             uv = df[col].dropna().astype(str).unique()
             qual_unique_values[col] = sorted([v for v in uv if str(v).strip() != ''])
 
@@ -1623,13 +1946,18 @@ class ExcelViewerApp:
             rows.append(row_data)
         return columns, rows, small_features, group_counts
 
-    def _compute_mean_rows(self, df, qual_selected, quant_selected, decimals=None):
+    def _compute_mean_rows(self, df, qual_selected, quant_selected, decimals=None,
+                           fixed_values=None):
         """Возвращает (columns, rows) для таблицы среднее ± стандартное отклонение (M ± SD).
         Только для количественных признаков-строк.
         Если задан decimals — числа округляются по стандартным математическим
-        правилам до указанного числа знаков и выводятся с фиксированной точностью."""
+        правилам до указанного числа знаков и выводятся с фиксированной точностью.
+        fixed_values — заранее заданный состав значений группирующих признаков."""
         qual_unique_values = {}
         for col in qual_selected:
+            if fixed_values and col in fixed_values:
+                qual_unique_values[col] = list(fixed_values[col])
+                continue
             uv = df[col].dropna().astype(str).unique()
             qual_unique_values[col] = sorted([v for v in uv if str(v).strip() != ''])
 
@@ -1696,6 +2024,93 @@ class ExcelViewerApp:
             rows.append(row_data)
         return columns, rows
 
+    @staticmethod
+    def _top_short(td):
+        """Короткая подпись верхнеуровневой группы для заголовков столбцов."""
+        if td.get("total"):
+            base = "Вся когорта"
+        else:
+            base = str(td.get("value", ""))
+        n = td.get("n")
+        return f"{base} (N={n})" if n is not None else base
+
+    def _build_top_treeview(self, frame, block, xbar):
+        """Строит таблицу с верхнеуровневыми группами: столбцы каждой обычной
+        группы дублируются внутри каждой верхнеуровневой группы, у каждой —
+        свои столбцы p."""
+        subs = block["subs"]
+        group_defs = self._block_group_defs(block)
+        n_groups = len(group_defs)
+        per_top_specs = self._top_p_specs(block)
+        n_p = max((len(s) for s in per_top_specs), default=0)
+        vh = block.get("value_header", "n (%)")
+        is_count = (block["sub_kind"] == "count")
+
+        col_ids = ["priznak", "kategoria"] if is_count else ["metric"]
+        for ti in range(len(subs)):
+            for gi in range(n_groups):
+                col_ids += [f"n_{ti}_{gi}", f"v_{ti}_{gi}"]
+            for k in range(n_p):
+                col_ids.append(f"p_{ti}_{k}")
+
+        # Собираем строки
+        if is_count:
+            per_top_flat = [self._count_flat_rows(sub["model"], per_top_specs[ti])
+                            for ti, sub in enumerate(subs)]
+            n_rows_data = len(per_top_flat[0]) if per_top_flat else 0
+            rows_out = []
+            for j in range(n_rows_data):
+                base = per_top_flat[0][j]
+                out = [base[0], base[1]]
+                for ti in range(len(subs)):
+                    fr = per_top_flat[ti][j]
+                    out += list(fr[2:2 + 2 * n_groups])
+                    out += list(fr[2 + 2 * n_groups:])
+                rows_out.append(out)
+        else:
+            feats = block.get("quant_features", [])
+            rows_out = []
+            for i, feat in enumerate(feats):
+                out = [feat]
+                for ti, sub in enumerate(subs):
+                    r = sub["rows"][i] if i < len(sub["rows"]) else []
+                    vals = list(r[1:]) if r else []
+                    # выравниваем длину (на случай отсутствующих групп)
+                    while len(vals) < 2 * n_groups:
+                        vals.append("")
+                    out += vals[:2 * n_groups]
+                    for k in range(n_p):
+                        sp = per_top_specs[ti][k] if k < len(per_top_specs[ti]) else None
+                        out.append(sp["pvalues"].get(feat, "") if sp else "")
+                rows_out.append(out)
+
+        tv = ttk.Treeview(frame, columns=col_ids, show="headings",
+                          height=max(1, len(rows_out)), xscrollcommand=xbar.set)
+        if is_count:
+            tv.heading("priznak", text="Признак")
+            tv.column("priznak", width=170, minwidth=110)
+            tv.heading("kategoria", text="Категория")
+            tv.column("kategoria", width=110, minwidth=70)
+        else:
+            tv.heading("metric", text="Метрика")
+            tv.column("metric", width=170, minwidth=110)
+
+        for ti, sub in enumerate(subs):
+            short = self._top_short(sub["top"])
+            for gi, g in enumerate(group_defs):
+                tv.heading(f"n_{ti}_{gi}", text=f"{short} | N ({g['label']})")
+                tv.column(f"n_{ti}_{gi}", width=60, minwidth=45, anchor="center")
+                tv.heading(f"v_{ti}_{gi}", text=f"{short} | {g['label']}")
+                tv.column(f"v_{ti}_{gi}", width=140, minwidth=85)
+            for k in range(n_p):
+                sp = per_top_specs[ti][k] if k < len(per_top_specs[ti]) else {"header": "p"}
+                tv.heading(f"p_{ti}_{k}", text=f"{short} | {sp['header']}")
+                tv.column(f"p_{ti}_{k}", width=95, minwidth=55, anchor="center")
+
+        for i, r in enumerate(rows_out):
+            tv.insert("", tk.END, values=r, tags=('evenrow' if i % 2 == 0 else 'oddrow',))
+        return tv
+
     def _render_block(self, window, block):
         """Рисует один блок-таблицу в области результатов (со своими столбцами)."""
         frame = tk.LabelFrame(window.results_inner, text=block.get("kind_label", ""),
@@ -1733,7 +2148,9 @@ class ExcelViewerApp:
         xbar = ttk.Scrollbar(frame, orient=tk.HORIZONTAL)
         xbar.pack(side=tk.BOTTOM, fill=tk.X)
 
-        if block["kind"] == "quant":
+        if block["kind"] == "top":
+            tv = self._build_top_treeview(frame, block, xbar)
+        elif block["kind"] == "quant":
             base_cols = list(block["columns"])
             p_ids = [f"p{i}" for i in range(len(specs))]
             columns = base_cols + p_ids
@@ -1862,7 +2279,8 @@ class ExcelViewerApp:
         """Открывает то же окно расчёта p для повторного расчёта (добавит новый столбец p)."""
         if block.get("merged"):
             return
-        if block["kind"] == "quant":
+        kind = block["sub_kind"] if block["kind"] == "top" else block["kind"]
+        if kind == "quant":
             self._open_pvalue_dialog(window.df, window, block)
         else:
             self._open_count_pvalue_dialog(window, block)
@@ -1929,7 +2347,11 @@ class ExcelViewerApp:
         return f"{pct:.{d}f}".replace('.', ',')
 
     def _compute_count_structure(self, df, qual_selected, quant_selected, only_group=None,
-                                 pct_manual=False, pct_decimals=0):
+                                 pct_manual=False, pct_decimals=0,
+                                 fixed_values=None, fixed_cats=None):
+        """fixed_values / fixed_cats — заранее заданные составы групп-столбцов и
+        категорий признаков (для верхнеуровневых таблиц, чтобы структура таблицы
+        была одинаковой во всех верхнеуровневых группах)."""
         pv = self._pretty_value
         groups = []
         if only_group is not None:
@@ -1938,14 +2360,20 @@ class ExcelViewerApp:
             groups.append({'col': gcol, 'value': gval, 'label': f"{gcol} = {gval}"})
         else:
             for qcol in qual_selected:
-                vals = sorted([pv(v) for v in df[qcol].dropna().astype(str).unique()
-                               if str(v).strip() != ''])
+                if fixed_values and qcol in fixed_values:
+                    vals = list(fixed_values[qcol])
+                else:
+                    vals = sorted([pv(v) for v in df[qcol].dropna().astype(str).unique()
+                                   if str(v).strip() != ''])
                 for v in vals:
                     groups.append({'col': qcol, 'value': v, 'label': f"{qcol} = {v}"})
         features = []
         for feat in quant_selected:
-            cats_all = sorted([pv(v) for v in df[feat].dropna().astype(str).unique()
-                               if str(v).strip() != ''])
+            if fixed_cats and feat in fixed_cats:
+                cats_all = list(fixed_cats[feat])
+            else:
+                cats_all = sorted([pv(v) for v in df[feat].dropna().astype(str).unique()
+                                   if str(v).strip() != ''])
             # Показываем ВСЕ категории признака (например, и yes, и no), без сворачивания
             shown_cats, binary = cats_all, False
             rows = []
@@ -2497,6 +2925,134 @@ class ExcelViewerApp:
                 except Exception:
                     pass
 
+    def _append_top_table(self, doc, block, crit_index=None):
+        """Таблица с верхнеуровневыми группами. Шапка в три уровня:
+        верхнеуровневая группа → обычная группа-столбец → N / значение.
+        Столбцы p каждой верхнеуровневой группы объединены по всей шапке."""
+        subs = block["subs"]
+        group_defs = self._block_group_defs(block)
+        n_groups = len(group_defs)
+        per_top_specs = self._top_p_specs(block)
+        n_p = 0 if block.get("no_p") else max((len(s) for s in per_top_specs), default=0)
+        vh = block.get("value_header", "n (%)")
+        is_count = (block["sub_kind"] == "count")
+        crit_index = crit_index or {}
+
+        name_cols = 2 if is_count else 1
+        per_top_cols = 2 * n_groups + n_p
+        total_cols = name_cols + per_top_cols * len(subs)
+        HDR = 3
+
+        if is_count:
+            features = subs[0]["model"]["features"]
+            n_data = sum(len(f["rows"]) for f in features)
+        else:
+            feats = block.get("quant_features", [])
+            n_data = len(feats)
+
+        table = doc.add_table(rows=HDR + n_data, cols=total_cols)
+        table.style = 'Table Grid'
+        table.autofit = False
+
+        # --- Шапка ---
+        head = table.cell(0, 0).merge(table.cell(HDR - 1, name_cols - 1))
+        self._set_word_cell(head, "Признак", True, 1)
+
+        col = name_cols
+        for ti, sub in enumerate(subs):
+            gh = table.cell(0, col).merge(table.cell(0, col + 2 * n_groups - 1))
+            self._set_word_cell(gh, self._top_short(sub["top"]), True, 1)
+            c = col
+            for g in group_defs:
+                g2 = table.cell(1, c).merge(table.cell(1, c + 1))
+                self._set_word_cell(g2, g["label"], True, 1)
+                self._set_word_cell(table.cell(2, c), "N", True, 1)
+                self._set_word_cell(table.cell(2, c + 1), vh, True, 1)
+                c += 2
+            for k in range(n_p):
+                sp = per_top_specs[ti][k] if k < len(per_top_specs[ti]) else {"header": "p"}
+                hp = table.cell(0, c).merge(table.cell(HDR - 1, c))
+                self._set_word_cell(hp, sp["header"], True, 1)
+                c += 1
+            col += per_top_cols
+
+        # --- Данные ---
+        r = HDR
+        if not is_count:
+            for i, feat in enumerate(feats):
+                self._set_word_cell(table.cell(r, 0), feat, False, 0)
+                col = name_cols
+                for ti, sub in enumerate(subs):
+                    row = sub["rows"][i] if i < len(sub["rows"]) else []
+                    vals = list(row[1:]) if row else []
+                    while len(vals) < 2 * n_groups:
+                        vals.append("")
+                    c = col
+                    for gi in range(n_groups):
+                        self._set_word_cell(table.cell(r, c), vals[2 * gi], False, 1)
+                        self._set_word_cell(table.cell(r, c + 1), vals[2 * gi + 1], False, 0)
+                        c += 2
+                    for k in range(n_p):
+                        sp = per_top_specs[ti][k] if k < len(per_top_specs[ti]) else None
+                        txt = sp["pvalues"].get(feat, "") if sp else ""
+                        crit = sp["p_criteria"].get(feat) if sp else None
+                        self._set_pcell(table.cell(r, c), txt, crit_index.get(crit), 1)
+                        c += 1
+                    col += per_top_cols
+                r += 1
+        else:
+            for fi, f in enumerate(features):
+                n_sub = len(f["rows"])
+                start = r
+                for ri, row in enumerate(f["rows"]):
+                    self._set_word_cell(table.cell(r, 1), row["category"], False, 0)
+                    col = name_cols
+                    for ti, sub in enumerate(subs):
+                        srow = sub["model"]["features"][fi]["rows"][ri]
+                        c = col
+                        for gi in range(n_groups):
+                            cl = srow["cells"][gi]
+                            self._set_word_cell(table.cell(r, c),
+                                                "" if cl["N"] is None else cl["N"], False, 1)
+                            self._set_word_cell(table.cell(r, c + 1), cl["np"], False, 0)
+                            c += 2
+                        col += per_top_cols
+                    r += 1
+                # Название признака — объединяем по его категориям
+                nm = table.cell(start, 0)
+                for k in range(1, n_sub):
+                    nm = nm.merge(table.cell(start + k, 0))
+                self._set_word_cell(nm, f["name"], False, 0)
+                # N и p — объединяем по категориям внутри каждой верхнеуровневой группы
+                col = name_cols
+                for ti, sub in enumerate(subs):
+                    c = col
+                    for gi in range(n_groups):
+                        ncell = table.cell(start, c)
+                        for k in range(1, n_sub):
+                            ncell = ncell.merge(table.cell(start + k, c))
+                        nval = sub["model"]["features"][fi]["rows"][0]["cells"][gi]["N"]
+                        self._set_word_cell(ncell, "" if nval is None else nval, False, 1)
+                        c += 2
+                    for k2 in range(n_p):
+                        pcell = table.cell(start, c)
+                        for k in range(1, n_sub):
+                            pcell = pcell.merge(table.cell(start + k, c))
+                        sp = per_top_specs[ti][k2] if k2 < len(per_top_specs[ti]) else None
+                        txt = sp["pvalues"].get(f["name"], "") if sp else ""
+                        crit = sp["p_criteria"].get(f["name"]) if sp else None
+                        self._set_pcell(pcell, txt, crit_index.get(crit), 1)
+                        c += 1
+                    col += per_top_cols
+                r = start + n_sub
+
+        for row in table.rows:
+            for cell in row.cells:
+                cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+                for paragraph in cell.paragraphs:
+                    for run in paragraph.runs:
+                        run.font.size = Pt(9)
+
     def export_to_word(self, df, window):
         """Выгружает ВСЕ добавленные таблицы в один документ Word (одна под другой)."""
         blocks = getattr(window, "result_blocks", [])
@@ -2522,21 +3078,27 @@ class ExcelViewerApp:
                 run.font.size = Pt(11)
 
                 # Столбцы p (может быть несколько) и нумерация критериев
-                specs = [] if block.get("no_p") else self._p_column_specs(block)
-                crit_index, used = self._p_criteria_index(
-                    specs, block.get("always_label_criterion", False))
-
-                if block["kind"] == "quant":
-                    self._append_quant_table(doc, block["columns"], block["rows"],
-                                             specs, crit_index,
-                                             block.get("value_header", "Me [Q1; Q3]"))
+                if block["kind"] == "top":
+                    all_specs = [sp for lst in self._top_p_specs(block) for sp in lst]
+                    crit_index, used = self._p_criteria_index(
+                        all_specs, block.get("always_label_criterion", False))
+                    self._append_top_table(doc, block, crit_index)
                 else:
-                    self._append_count_table(doc, block["model"], specs, crit_index,
-                                             block.get("value_header", "n (%)"))
-                    if block.get("ci"):
-                        ci_p = doc.add_paragraph()
-                        ci_run = ci_p.add_run(block["ci"]["text"])
-                        ci_run.font.size = Pt(10)
+                    specs = [] if block.get("no_p") else self._p_column_specs(block)
+                    crit_index, used = self._p_criteria_index(
+                        specs, block.get("always_label_criterion", False))
+
+                    if block["kind"] == "quant":
+                        self._append_quant_table(doc, block["columns"], block["rows"],
+                                                 specs, crit_index,
+                                                 block.get("value_header", "Me [Q1; Q3]"))
+                    else:
+                        self._append_count_table(doc, block["model"], specs, crit_index,
+                                                 block.get("value_header", "n (%)"))
+                        if block.get("ci"):
+                            ci_p = doc.add_paragraph()
+                            ci_run = ci_p.add_run(block["ci"]["text"])
+                            ci_run.font.size = Pt(10)
 
                 # Расшифровка индексов критериев под таблицей (если критериев больше одного)
                 if crit_index:
