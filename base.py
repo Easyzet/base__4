@@ -5,8 +5,9 @@ import threading
 import time
 from typing import Dict, List, Optional
 from docx import Document
-from docx.shared import Inches, Pt
+from docx.shared import Inches, Pt, Cm
 from docx.enum.table import WD_ALIGN_VERTICAL
+from docx.enum.section import WD_ORIENT, WD_SECTION
 import numpy as np
 import math
 import re
@@ -23,7 +24,7 @@ import urllib.error
 #  Достаточно менять __version__ и пушить обновлённый файл в ветку —
 #  публиковать релизы не требуется.
 # --------------------------------------------------------------------------
-__version__ = "1.1.0"                 # текущая версия приложения (увеличивайте при каждом обновлении)
+__version__ = "1.1.1"                 # текущая версия приложения (увеличивайте при каждом обновлении)
 GITHUB_OWNER = "Easyzet"             # владелец репозитория на GitHub
 GITHUB_REPO = "base__4"              # имя репозитория
 GITHUB_BRANCH = "main"               # ветка, из которой берётся обновление (обычно main или master)
@@ -2925,6 +2926,24 @@ class ExcelViewerApp:
                 except Exception:
                     pass
 
+    @staticmethod
+    def _set_section_orientation(section, landscape):
+        """Задаёт ориентацию раздела Word. Важно: python-docx не меняет размер
+        страницы автоматически, поэтому ширину и высоту меняем местами вручную."""
+        w, h = section.page_width, section.page_height
+        long_side, short_side = max(w, h), min(w, h)
+        if landscape:
+            section.orientation = WD_ORIENT.LANDSCAPE
+            section.page_width, section.page_height = long_side, short_side
+            # Узкие поля — чтобы широкая таблица помещалась по ширине листа
+            section.left_margin = section.right_margin = Cm(1.27)
+            section.top_margin = section.bottom_margin = Cm(1.27)
+        else:
+            section.orientation = WD_ORIENT.PORTRAIT
+            section.page_width, section.page_height = short_side, long_side
+            section.left_margin = section.right_margin = Cm(2.0)
+            section.top_margin = section.bottom_margin = Cm(2.0)
+
     def _append_top_table(self, doc, block, crit_index=None):
         """Таблица с верхнеуровневыми группами. Шапка в три уровня:
         верхнеуровневая группа → обычная группа-столбец → N / значение.
@@ -3053,6 +3072,33 @@ class ExcelViewerApp:
                     for run in paragraph.runs:
                         run.font.size = Pt(9)
 
+        # --- Подгонка ширины столбцов под ширину листа ---
+        widths = [Inches(1.4)]
+        if is_count:
+            widths.append(Inches(0.95))
+        val_w = 1.0 if len(vh) > 6 else 0.8
+        for _ in subs:
+            for _g in range(n_groups):
+                widths += [Inches(0.38), Inches(val_w)]
+            for _k in range(n_p):
+                widths.append(Inches(0.62))
+        try:
+            sec = doc.sections[-1]
+            avail = sec.page_width - sec.left_margin - sec.right_margin
+            total = sum(w for w in widths)
+            if total > avail and total > 0:
+                k = float(avail) / float(total)
+                widths = [Inches(w.inches * k) for w in widths]
+        except Exception:
+            pass
+        for c_idx in range(total_cols):
+            w = widths[c_idx] if c_idx < len(widths) else Inches(0.6)
+            for r_idx in range(len(table.rows)):
+                try:
+                    table.cell(r_idx, c_idx).width = w
+                except Exception:
+                    pass
+
     def export_to_word(self, df, window):
         """Выгружает ВСЕ добавленные таблицы в один документ Word (одна под другой)."""
         blocks = getattr(window, "result_blocks", [])
@@ -3070,7 +3116,21 @@ class ExcelViewerApp:
 
         try:
             doc = Document()
+            cur_landscape = False
             for idx, block in enumerate(blocks):
+                is_top = (block["kind"] == "top")
+                # Верхнеуровневые таблицы — каждая на отдельном листе в альбомной
+                # ориентации; после них возвращаемся к книжной.
+                if is_top:
+                    if idx == 0:
+                        self._set_section_orientation(doc.sections[0], True)
+                    else:
+                        self._set_section_orientation(doc.add_section(WD_SECTION.NEW_PAGE), True)
+                    cur_landscape = True
+                elif cur_landscape:
+                    self._set_section_orientation(doc.add_section(WD_SECTION.NEW_PAGE), False)
+                    cur_landscape = False
+
                 heading = doc.add_paragraph()
                 label = block.get("kind_label", block.get("title", "Таблица"))
                 run = heading.add_run(f"{idx + 1}. {label}")
@@ -3110,7 +3170,10 @@ class ExcelViewerApp:
                         nm = fp.add_run(" — " + c)
                         nm.font.size = Pt(9)
 
-                if idx != len(blocks) - 1:
+                # Пустая строка-разделитель не нужна, если дальше начинается
+                # новый лист (верхнеуровневая таблица или возврат к книжной).
+                nxt_top = (blocks[idx + 1]["kind"] == "top") if idx + 1 < len(blocks) else False
+                if idx != len(blocks) - 1 and not is_top and not nxt_top:
                     doc.add_paragraph("")
 
             doc.save(file_path)
